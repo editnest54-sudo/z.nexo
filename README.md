@@ -1,53 +1,45 @@
 # Telegram Music Bot
 
-Python + aiogram music bot for a Telegram channel.
+ربات مدیریت انتشار و دانلود آهنگ با Python، aiogram و SQLite.
 
-## Features
+## قابلیت‌ها
 
-- Admin-only management panel
-- Publish preview audio to the channel
-- One-version posts show `دانلود آهنگ کامل`
-- Multiple versions show `نسخه ۱ | نسخه ۲ | ...`
-- Deep links immediately send the requested full file
-- Replace a full-song file without changing the existing deep link
-- Add new versions
-- Search by numeric ID or title/artist
-- Edit title/artist
-- Delete a song and its channel post
-- Basic statistics
-- SQLite database
+- انتشار Preview به شکل Audio، Voice، Video یا Document
+- فایل کامل هم می‌تواند Audio، Voice، Video یا Document باشد
+- لینک دانلود کامل داخل کپشن پست کانال ساخته می‌شود
+- فایل نسخه بعداً قابل جایگزینی است و لینک قبلی تغییر نمی‌کند
+- پشتیبانی از چند نسخه برای یک آهنگ
+- نام آهنگ و نام خواننده اختیاری هستند
+- عضویت در کانال قبل از دریافت فایل کامل بررسی می‌شود
+- پیام خوش‌آمدگویی برای کاربر عادی
+- پنل مدیریت با دکمه‌های رنگی جدید Telegram
+- جستجو با کد یا نام آهنگ/خواننده
+- آمار داخلی ربات، درخواست‌های دانلود و تعداد اعضای فعلی کانال
+- حذف آهنگ و پست کانال
 
-## Files
-
-- `bot.py` - main bot
-- `requirements.txt` - Python dependencies
-- `.env.example` - environment variable template
-- `README.md` - project notes
-
-## Environment variables
-
-Set these in your hosting provider's Environment Variables section:
-
-- `BOT_TOKEN`
-- `ADMIN_ID`
-- `CHANNEL_ID`
-- `BOT_USERNAME`
-
-Do not upload a real `.env` file or expose your bot token on GitHub.
-
-## Run
+## نصب
 
 ```bash
 pip install -r requirements.txt
 python bot.py
 ```
 
-## Telegram setup
+## متغیرهای محیطی
 
-The bot must be an administrator of the target channel with permission to post/edit/delete channel messages.
+```env
+BOT_TOKEN=توکن ربات
+ADMIN_ID=آیدی عددی ادمین
+CHANNEL_ID=-1001234567890
+BOT_USERNAME=نام ربات بدون @
+CHANNEL_URL=https://t.me/username
+```
 
-The bot should also have a public username because channel download links use Telegram deep links.
+`CHANNEL_URL` برای دکمه «عضویت در کانال» است. اگر کانال خصوصی است، یک لینک دعوت مناسب را در این متغیر قرار بده.
 
-## Important
+## دسترسی ربات در کانال
 
-Only upload and distribute audio files you have permission to distribute.
+ربات باید در کانال ادمین باشد و حداقل دسترسی ارسال پیام و حذف پیام داشته باشد. برای بررسی عضویت کاربران نیز ربات باید عضو/ادمین کانال باشد.
+
+## نکته درباره آمار
+
+تعداد درخواست‌های دانلود توسط خود ربات در SQLite ثبت می‌شود. تعداد اعضای فعلی کانال از Telegram Bot API خوانده می‌شود. آمارهایی که Bot API ارائه نمی‌کند، به‌صورت ساختگی نمایش داده نمی‌شوند.

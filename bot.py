@@ -17,6 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 DB_NAME = os.getenv("DB_NAME", "music_bot.db")
 
 if not BOT_TOKEN:
@@ -28,16 +29,10 @@ if not CHANNEL_ID:
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME is not set")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-
-# The bot is intended for one owner/admin, so a small in-memory state machine
-# is enough for the management panel. Song/file data itself is persistent in SQLite.
 admin_state = {}
 
 
@@ -53,8 +48,8 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS songs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                artist TEXT NOT NULL,
+                title TEXT,
+                artist TEXT,
                 channel_message_id INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -65,12 +60,48 @@ def init_db():
                 song_id INTEGER NOT NULL,
                 version_no INTEGER NOT NULL,
                 file_id TEXT NOT NULL,
+                file_type TEXT NOT NULL DEFAULT 'audio',
                 preview_file_id TEXT NOT NULL,
+                preview_type TEXT NOT NULL DEFAULT 'audio',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(song_id, version_no),
                 FOREIGN KEY(song_id) REFERENCES songs(id) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS download_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                song_id INTEGER NOT NULL,
+                version_no INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(song_id) REFERENCES songs(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Migrate databases created by the older project version.
+        song_cols = {r["name"] for r in conn.execute("PRAGMA table_info(songs)").fetchall()}
+        if "title" not in song_cols:
+            conn.execute("ALTER TABLE songs ADD COLUMN title TEXT")
+        if "artist" not in song_cols:
+            conn.execute("ALTER TABLE songs ADD COLUMN artist TEXT")
+
+        version_cols = {r["name"] for r in conn.execute("PRAGMA table_info(versions)").fetchall()}
+        if "file_type" not in version_cols:
+            conn.execute("ALTER TABLE versions ADD COLUMN file_type TEXT NOT NULL DEFAULT 'audio'")
+        if "preview_type" not in version_cols:
+            conn.execute("ALTER TABLE versions ADD COLUMN preview_type TEXT NOT NULL DEFAULT 'audio'")
+
+        # Old installations used NOT NULL title/artist. SQLite cannot remove that
+        # constraint in place, but existing rows already have values. New rows use
+        # empty strings when a field is intentionally left blank.
         conn.commit()
 
 
@@ -78,58 +109,65 @@ def is_admin(user_id: int | None) -> bool:
     return user_id == ADMIN_ID
 
 
+def button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str | None = None):
+    kwargs = {"text": text}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if style is not None:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+
 def admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ انتشار آهنگ", callback_data="publish")],
-            [InlineKeyboardButton(text="🔍 جستجو", callback_data="search")],
-            [InlineKeyboardButton(text="📊 آمار", callback_data="stats")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("➕ انتشار آهنگ", callback_data="publish", style="success")],
+        [button("🔍 جستجو", callback_data="search", style="primary"), button("📊 آمار", callback_data="stats", style="primary")],
+    ])
 
 
 def song_menu(song_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔄 جایگزینی نسخه",
-                    callback_data=f"replace:{song_id}",
-                ),
-                InlineKeyboardButton(
-                    text="➕ افزودن نسخه",
-                    callback_data=f"addversion:{song_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ ویرایش اطلاعات",
-                    callback_data=f"edit:{song_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🗑 حذف آهنگ",
-                    callback_data=f"delete:{song_id}",
-                ),
-            ],
-            [InlineKeyboardButton(text="⬅️ پنل مدیریت", callback_data="home")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("🔄 جایگزینی نسخه", callback_data=f"replace:{song_id}", style="primary"),
+         button("➕ افزودن نسخه", callback_data=f"addversion:{song_id}", style="success")],
+        [button("✏️ ویرایش اطلاعات", callback_data=f"edit:{song_id}", style="primary"),
+         button("🗑 حذف آهنگ", callback_data=f"delete:{song_id}", style="danger")],
+        [button("⬅️ پنل مدیریت", callback_data="home")],
+    ])
 
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ لغو", callback_data="cancel")]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[button("❌ لغو", callback_data="cancel", style="danger")]])
 
 
-def file_id_from_message(message: Message) -> str | None:
+def skip_keyboard(callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("⏭ خالی بگذار", callback_data=callback_data, style="primary")],
+        [button("❌ لغو", callback_data="cancel", style="danger")],
+    ])
+
+
+def media_from_message(message: Message) -> tuple[str, str] | None:
     if message.audio:
-        return message.audio.file_id
+        return message.audio.file_id, "audio"
+    if message.voice:
+        return message.voice.file_id, "voice"
+    if message.video:
+        return message.video.file_id, "video"
     if message.document:
-        return message.document.file_id
+        return message.document.file_id, "document"
     return None
+
+
+def send_media_kwargs(file_id: str, file_type: str) -> dict:
+    key = {
+        "audio": "audio",
+        "voice": "voice",
+        "video": "video",
+        "document": "document",
+    }.get(file_type, "document")
+    return {key: file_id}
 
 
 def download_link(song_id: int, version_no: int, label: str) -> str:
@@ -142,74 +180,59 @@ def download_link(song_id: int, version_no: int, label: str) -> str:
 def build_links(song_id: int) -> str:
     with closing(get_db()) as conn:
         versions = conn.execute(
-            """
-            SELECT version_no
-            FROM versions
-            WHERE song_id = ?
-            ORDER BY version_no
-            """,
+            "SELECT version_no FROM versions WHERE song_id = ? ORDER BY version_no",
             (song_id,),
         ).fetchall()
-
     if not versions:
         return ""
-
     if len(versions) == 1:
-        v = versions[0]["version_no"]
-        return download_link(song_id, v, "دانلود آهنگ کامل")
-
-    return " | ".join(
-        download_link(song_id, row["version_no"], f"نسخه {row['version_no']}")
-        for row in versions
-    )
+        return download_link(song_id, versions[0]["version_no"], "دانلود آهنگ کامل")
+    return " | ".join(download_link(song_id, r["version_no"], f"نسخه {r['version_no']}") for r in versions)
 
 
 def build_caption(song_id: int) -> str:
     with closing(get_db()) as conn:
-        song = conn.execute(
-            "SELECT title, artist FROM songs WHERE id = ?",
-            (song_id,),
-        ).fetchone()
-
+        song = conn.execute("SELECT title, artist FROM songs WHERE id = ?", (song_id,)).fetchone()
     if not song:
-        return ""
+        return "دانلود آهنگ کامل"
 
-    links = build_links(song_id)
-    return (
-        f"🎵 <b>{html.escape(song['title'])}</b>\n"
-        f"👤 {html.escape(song['artist'])}\n\n"
-        f"{links}"
-    )
+    lines = []
+    title = (song["title"] or "").strip()
+    artist = (song["artist"] or "").strip()
+    if title:
+        lines.append(f"🎵 <b>{html.escape(title)}</b>")
+    if artist:
+        lines.append(f"👤 {html.escape(artist)}")
+    if lines:
+        lines.append("")
+    lines.append(build_links(song_id))
+    return "\n".join(lines)
 
 
-async def publish_preview(song_id: int, preview_file_id: str) -> int:
-    sent = await bot.send_audio(
-        chat_id=CHANNEL_ID,
-        audio=preview_file_id,
-        caption=build_caption(song_id),
-        parse_mode="HTML",
-    )
+async def publish_preview(song_id: int, preview_file_id: str, preview_type: str) -> int:
+    kwargs = dict(chat_id=CHANNEL_ID, caption=build_caption(song_id), parse_mode="HTML")
+    kwargs.update(send_media_kwargs(preview_file_id, preview_type))
+
+    if preview_type == "audio":
+        sent = await bot.send_audio(**kwargs)
+    elif preview_type == "voice":
+        sent = await bot.send_voice(**kwargs)
+    elif preview_type == "video":
+        sent = await bot.send_video(**kwargs)
+    else:
+        sent = await bot.send_document(**kwargs)
 
     with closing(get_db()) as conn:
-        conn.execute(
-            "UPDATE songs SET channel_message_id = ? WHERE id = ?",
-            (sent.message_id, song_id),
-        )
+        conn.execute("UPDATE songs SET channel_message_id = ? WHERE id = ?", (sent.message_id, song_id))
         conn.commit()
-
     return sent.message_id
 
 
 async def update_channel_post(song_id: int):
     with closing(get_db()) as conn:
-        row = conn.execute(
-            "SELECT channel_message_id FROM songs WHERE id = ?",
-            (song_id,),
-        ).fetchone()
-
+        row = conn.execute("SELECT channel_message_id FROM songs WHERE id = ?", (song_id,)).fetchone()
     if not row or not row["channel_message_id"]:
         return
-
     try:
         await bot.edit_message_caption(
             chat_id=CHANNEL_ID,
@@ -223,49 +246,30 @@ async def update_channel_post(song_id: int):
 
 def get_song(song_id: int):
     with closing(get_db()) as conn:
-        return conn.execute(
-            "SELECT * FROM songs WHERE id = ?",
-            (song_id,),
-        ).fetchone()
+        return conn.execute("SELECT * FROM songs WHERE id = ?", (song_id,)).fetchone()
 
 
 def get_version(song_id: int, version_no: int):
     with closing(get_db()) as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM versions
-            WHERE song_id = ? AND version_no = ?
-            """,
-            (song_id, version_no),
-        ).fetchone()
+        return conn.execute("SELECT * FROM versions WHERE song_id = ? AND version_no = ?", (song_id, version_no)).fetchone()
 
 
 def format_song(song_id: int) -> str:
     with closing(get_db()) as conn:
-        song = conn.execute(
-            "SELECT * FROM songs WHERE id = ?",
-            (song_id,),
-        ).fetchone()
-        versions = conn.execute(
-            """
-            SELECT version_no
-            FROM versions
-            WHERE song_id = ?
-            ORDER BY version_no
-            """,
-            (song_id,),
-        ).fetchall()
-
+        song = conn.execute("SELECT * FROM songs WHERE id = ?", (song_id,)).fetchone()
+        versions = conn.execute("SELECT version_no FROM versions WHERE song_id = ? ORDER BY version_no", (song_id,)).fetchall()
+        downloads = conn.execute("SELECT COUNT(*) AS c FROM download_stats WHERE song_id = ?", (song_id,)).fetchone()["c"]
     if not song:
         return "آهنگ پیدا نشد."
-
+    title = (song["title"] or "بدون نام").strip() or "بدون نام"
+    artist = (song["artist"] or "بدون خواننده").strip() or "بدون خواننده"
     version_text = ", ".join(str(v["version_no"]) for v in versions) or "ندارد"
     return (
-        f"🎵 <b>{html.escape(song['title'])}</b>\n"
-        f"👤 {html.escape(song['artist'])}\n"
+        f"🎵 <b>{html.escape(title)}</b>\n"
+        f"👤 {html.escape(artist)}\n"
         f"🆔 کد: <code>{song_id}</code>\n"
-        f"🎚 نسخه‌ها: {version_text}"
+        f"🎚 نسخه‌ها: {version_text}\n"
+        f"⬇️ درخواست دانلود: {downloads}"
     )
 
 
@@ -273,97 +277,128 @@ def clear_state():
     admin_state.pop(ADMIN_ID, None)
 
 
-async def show_search_results(message: Message, query: str):
-    query = query.strip()
-
+def remember_user(user_id: int):
     with closing(get_db()) as conn:
-        if query.isdigit():
-            rows = conn.execute(
-                """
-                SELECT id, title, artist
-                FROM songs
-                WHERE id = ?
-                LIMIT 10
-                """,
-                (int(query),),
-            ).fetchall()
-        else:
-            like = f"%{query}%"
-            rows = conn.execute(
-                """
-                SELECT id, title, artist
-                FROM songs
-                WHERE title LIKE ? OR artist LIKE ?
-                ORDER BY id DESC
-                LIMIT 10
-                """,
-                (like, like),
-            ).fetchall()
+        conn.execute(
+            "INSERT INTO users(user_id) VALUES (?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at=CURRENT_TIMESTAMP",
+            (user_id,),
+        )
+        conn.commit()
 
-    if not rows:
-        await message.answer("موردی پیدا نشد.", reply_markup=admin_menu())
-        return
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"{row['title']} | {row['artist']}",
-                    callback_data=f"song:{row['id']}",
-                )
-            ]
-            for row in rows
-        ]
-    )
+def record_download(song_id: int, version_no: int, user_id: int):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO download_stats(song_id, version_no, user_id) VALUES (?, ?, ?)",
+            (song_id, version_no, user_id),
+        )
+        conn.commit()
 
-    await message.answer(
-        "نتایج جستجو:",
-        reply_markup=keyboard,
-    )
+
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    url = CHANNEL_URL
+    if not url:
+        url = f"https://t.me/{CHANNEL_URL.lstrip('@')}" if CHANNEL_URL else "https://t.me/"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("📢 عضویت در کانال", url=url, style="primary")],
+        [button("✅ بررسی عضویت", callback_data="check_membership", style="success")],
+    ])
+
+
+async def is_channel_member(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in {"creator", "administrator", "member"} or (
+            member.status == "restricted" and getattr(member, "is_member", False)
+        )
+    except Exception:
+        logging.exception("Membership check failed for user %s", user_id)
+        return False
+
+
+async def send_requested_file(chat_id: int, version):
+    kwargs = dict(chat_id=chat_id)
+    kwargs.update(send_media_kwargs(version["file_id"], version["file_type"]))
+    if version["file_type"] == "audio":
+        return await bot.send_audio(**kwargs)
+    if version["file_type"] == "voice":
+        return await bot.send_voice(**kwargs)
+    if version["file_type"] == "video":
+        return await bot.send_video(**kwargs)
+    return await bot.send_document(**kwargs)
+
+
+async def deliver_pending_song(user_id: int, chat_id: int, song_id: int, version_no: int) -> bool:
+    version = get_version(song_id, version_no)
+    if not version:
+        await bot.send_message(chat_id, "این نسخه دیگر وجود ندارد.")
+        return True
+    if not await is_channel_member(user_id):
+        admin_state[user_id] = {
+            "action": "pending_download",
+            "song_id": song_id,
+            "version_no": version_no,
+        }
+        await bot.send_message(
+            chat_id,
+            "برای دریافت فایل کامل، ابتدا عضو کانال شوید و بعد «بررسی عضویت» را بزنید.",
+            reply_markup=welcome_keyboard(),
+        )
+        return False
+    await send_requested_file(chat_id, version)
+    record_download(song_id, version_no, user_id)
+    return True
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
+    remember_user(message.from_user.id)
     parts = message.text.split(maxsplit=1)
-
     if len(parts) == 1:
         if is_admin(message.from_user.id):
+            await message.answer("پنل مدیریت:", reply_markup=admin_menu())
+        else:
             await message.answer(
-                "پنل مدیریت:",
-                reply_markup=admin_menu(),
+                "🎵 خوش اومدی!\n\nبرای دریافت آهنگ کامل، ابتدا عضو کانال شو و بعد بررسی عضویت را بزن.",
+                reply_markup=welcome_keyboard(),
             )
         return
 
     payload = parts[1].strip()
     match = re.fullmatch(r"s(\d+)v(\d+)", payload)
-
-    # Normal users only get the requested song. No user menu, search, or stats.
     if not match:
         return
 
     song_id = int(match.group(1))
     version_no = int(match.group(2))
-    version = get_version(song_id, version_no)
+    await deliver_pending_song(message.from_user.id, message.chat.id, song_id, version_no)
 
-    if not version:
+
+@dp.callback_query(F.data == "check_membership")
+async def check_membership_callback(callback: CallbackQuery):
+    remember_user(callback.from_user.id)
+    if not await is_channel_member(callback.from_user.id):
+        await callback.answer("هنوز عضویت شما تأیید نشد.", show_alert=True)
         return
 
-    await bot.send_audio(
-        chat_id=message.chat.id,
-        audio=version["file_id"],
-    )
+    await callback.answer("عضویت تأیید شد.")
+    # A pending deep-link is stored per user when needed.
+    pending = admin_state.get(callback.from_user.id)
+    if pending and pending.get("action") == "pending_download":
+        song_id = pending["song_id"]
+        version_no = pending["version_no"]
+        admin_state.pop(callback.from_user.id, None)
+        await deliver_pending_song(callback.from_user.id, callback.from_user.id, song_id, version_no)
+    else:
+        await callback.message.answer("عضویت شما تأیید شد. حالا از لینک آهنگ وارد شوید.")
 
 
 @dp.callback_query(F.data == "home")
 async def home_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     clear_state()
-    await callback.message.answer(
-        "پنل مدیریت:",
-        reply_markup=admin_menu(),
-    )
+    await callback.message.answer("پنل مدیریت:", reply_markup=admin_menu())
     await callback.answer()
 
 
@@ -371,12 +406,8 @@ async def home_callback(callback: CallbackQuery):
 async def cancel_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     clear_state()
-    await callback.message.answer(
-        "لغو شد.",
-        reply_markup=admin_menu(),
-    )
+    await callback.message.answer("لغو شد.", reply_markup=admin_menu())
     await callback.answer()
 
 
@@ -384,17 +415,34 @@ async def cancel_callback(callback: CallbackQuery):
 async def publish_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
+    admin_state[ADMIN_ID] = {"action": "publish", "step": "title", "data": {}}
+    await callback.message.answer("نام آهنگ را ارسال کن یا «خالی بگذار» را بزن:", reply_markup=skip_keyboard("publish_skip_title"))
+    await callback.answer()
 
-    admin_state[ADMIN_ID] = {
-        "action": "publish",
-        "step": "title",
-        "data": {},
-    }
 
-    await callback.message.answer(
-        "نام آهنگ را ارسال کن:",
-        reply_markup=cancel_keyboard(),
-    )
+@dp.callback_query(F.data == "publish_skip_title")
+async def publish_skip_title(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "publish":
+        return
+    state["data"]["title"] = ""
+    state["step"] = "artist"
+    await callback.message.answer("نام خواننده را ارسال کن یا «خالی بگذار» را بزن:", reply_markup=skip_keyboard("publish_skip_artist"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "publish_skip_artist")
+async def publish_skip_artist(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "publish":
+        return
+    state["data"]["artist"] = ""
+    state["step"] = "full"
+    await callback.message.answer("فایل کامل را ارسال کن. Audio، Voice، Video یا Document قابل قبول است:", reply_markup=cancel_keyboard())
     await callback.answer()
 
 
@@ -402,17 +450,8 @@ async def publish_callback(callback: CallbackQuery):
 async def search_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
-    admin_state[ADMIN_ID] = {
-        "action": "search",
-        "step": "query",
-        "data": {},
-    }
-
-    await callback.message.answer(
-        "کد آهنگ یا نام آهنگ / خواننده را ارسال کن:",
-        reply_markup=cancel_keyboard(),
-    )
+    admin_state[ADMIN_ID] = {"action": "search", "step": "query", "data": {}}
+    await callback.message.answer("کد آهنگ یا نام آهنگ / خواننده را ارسال کن:", reply_markup=cancel_keyboard())
     await callback.answer()
 
 
@@ -420,37 +459,77 @@ async def search_callback(callback: CallbackQuery):
 async def stats_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     with closing(get_db()) as conn:
         songs = conn.execute("SELECT COUNT(*) AS c FROM songs").fetchone()["c"]
         versions = conn.execute("SELECT COUNT(*) AS c FROM versions").fetchone()["c"]
+        users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        downloads = conn.execute("SELECT COUNT(*) AS c FROM download_stats").fetchone()["c"]
+        posts = conn.execute("SELECT COUNT(*) AS c FROM songs WHERE channel_message_id IS NOT NULL").fetchone()["c"]
+        top = conn.execute("""
+            SELECT s.id, COALESCE(NULLIF(s.title, ''), 'بدون نام') AS title,
+                   COUNT(d.id) AS downloads
+            FROM songs s LEFT JOIN download_stats d ON d.song_id = s.id
+            GROUP BY s.id ORDER BY downloads DESC, s.id DESC LIMIT 5
+        """).fetchall()
+
+    try:
+        channel_members = await bot.get_chat_member_count(CHANNEL_ID)
+        channel_line = f"👥 اعضای فعلی کانال: {channel_members}"
+    except Exception:
+        channel_line = "👥 اعضای کانال: قابل دریافت نیست"
+
+    top_text = ""
+    if top:
+        top_text = "\n\n🔥 بیشترین درخواست دانلود:\n" + "\n".join(
+            f"{i}. {html.escape(r['title'])} | {r['downloads']}" for i, r in enumerate(top, 1)
+        )
 
     await callback.message.answer(
-        f"📊 آمار\n\n"
-        f"تعداد آهنگ‌ها: {songs}\n"
-        f"تعداد نسخه‌ها: {versions}",
+        f"📊 <b>آمار ربات و کانال</b>\n\n"
+        f"🎵 آهنگ‌ها: {songs}\n"
+        f"🎚 نسخه‌ها: {versions}\n"
+        f"👤 کاربران ربات: {users}\n"
+        f"⬇️ درخواست‌های دانلود: {downloads}\n"
+        f"📢 پست‌های منتشرشده: {posts}\n"
+        f"{channel_line}"
+        f"{top_text}",
+        parse_mode="HTML",
         reply_markup=admin_menu(),
     )
     await callback.answer()
+
+
+async def show_search_results(message: Message, query: str):
+    query = query.strip()
+    with closing(get_db()) as conn:
+        if query.isdigit():
+            rows = conn.execute("SELECT id, title, artist FROM songs WHERE id = ? LIMIT 10", (int(query),)).fetchall()
+        else:
+            like = f"%{query}%"
+            rows = conn.execute("""
+                SELECT id, title, artist FROM songs
+                WHERE COALESCE(title, '') LIKE ? OR COALESCE(artist, '') LIKE ?
+                ORDER BY id DESC LIMIT 10
+            """, (like, like)).fetchall()
+    if not rows:
+        await message.answer("موردی پیدا نشد.", reply_markup=admin_menu())
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        button(f"{row['title'] or 'بدون نام'} | {row['artist'] or 'بدون خواننده'}", callback_data=f"song:{row['id']}", style="primary")
+    ] for row in rows])
+    await message.answer("نتایج جستجو:", reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("song:"))
 async def song_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
-    song = get_song(song_id)
-
-    if not song:
+    if not get_song(song_id):
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
-
-    await callback.message.answer(
-        format_song(song_id),
-        reply_markup=song_menu(song_id),
-    )
+    await callback.message.answer(format_song(song_id), reply_markup=song_menu(song_id), parse_mode="HTML")
     await callback.answer()
 
 
@@ -458,24 +537,13 @@ async def song_callback(callback: CallbackQuery):
 async def replace_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
-
     if not get_song(song_id):
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
-
-    admin_state[ADMIN_ID] = {
-        "action": "replace",
-        "step": "version",
-        "data": {"song_id": song_id},
-    }
-
-    await callback.message.answer(
-        "شماره نسخه‌ای که می‌خواهی فایلش عوض شود را ارسال کن:",
-        reply_markup=cancel_keyboard(),
-    )
+    admin_state[ADMIN_ID] = {"action": "replace", "step": "version", "data": {"song_id": song_id}}
+    await callback.message.answer("شماره نسخه‌ای که می‌خواهی فایل کاملش عوض شود را ارسال کن:", reply_markup=cancel_keyboard())
     await callback.answer()
 
 
@@ -483,39 +551,16 @@ async def replace_callback(callback: CallbackQuery):
 async def add_version_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
-
     if not get_song(song_id):
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
-
     with closing(get_db()) as conn:
-        row = conn.execute(
-            """
-            SELECT COALESCE(MAX(version_no), 0) AS max_version
-            FROM versions
-            WHERE song_id = ?
-            """,
-            (song_id,),
-        ).fetchone()
-
+        row = conn.execute("SELECT COALESCE(MAX(version_no), 0) AS max_version FROM versions WHERE song_id = ?", (song_id,)).fetchone()
     next_version = row["max_version"] + 1
-
-    admin_state[ADMIN_ID] = {
-        "action": "add_version",
-        "step": "full",
-        "data": {
-            "song_id": song_id,
-            "version_no": next_version,
-        },
-    }
-
-    await callback.message.answer(
-        f"نسخه {next_version}: فایل کامل را ارسال کن.",
-        reply_markup=cancel_keyboard(),
-    )
+    admin_state[ADMIN_ID] = {"action": "add_version", "step": "full", "data": {"song_id": song_id, "version_no": next_version}}
+    await callback.message.answer(f"نسخه {next_version}: فایل کامل را ارسال کن. Audio، Voice، Video یا Document:", reply_markup=cancel_keyboard())
     await callback.answer()
 
 
@@ -523,25 +568,47 @@ async def add_version_callback(callback: CallbackQuery):
 async def edit_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
-
-    if not get_song(song_id):
+    song = get_song(song_id)
+    if not song:
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
+    admin_state[ADMIN_ID] = {"action": "edit", "step": "title", "data": {"song_id": song_id}}
+    await callback.message.answer("نام جدید آهنگ را ارسال کن یا خالی بگذار:", reply_markup=skip_keyboard("edit_skip_title"))
+    await callback.answer()
 
-    admin_state[ADMIN_ID] = {
-        "action": "edit",
-        "step": "title",
-        "data": {"song_id": song_id},
-    }
 
-    await callback.message.answer(
-        "نام جدید آهنگ را ارسال کن.\n"
-        "برای بدون تغییر گذاشتن نام، همین نام فعلی را دوباره ارسال کن.",
-        reply_markup=cancel_keyboard(),
-    )
+@dp.callback_query(F.data == "edit_skip_title")
+async def edit_skip_title(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "edit":
+        return
+    song_id = state["data"]["song_id"]
+    song = get_song(song_id)
+    state["data"]["title"] = song["title"] if song else ""
+    state["step"] = "artist"
+    await callback.message.answer("نام جدید خواننده را ارسال کن یا خالی بگذار:", reply_markup=skip_keyboard("edit_skip_artist"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "edit_skip_artist")
+async def edit_skip_artist(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "edit":
+        return
+    song_id = state["data"]["song_id"]
+    state["data"]["artist"] = ""
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE songs SET title = ?, artist = ? WHERE id = ?", (state["data"].get("title", ""), "", song_id))
+        conn.commit()
+    clear_state()
+    await update_channel_post(song_id)
+    await callback.message.answer("اطلاعات آهنگ به‌روزرسانی شد.", reply_markup=song_menu(song_id))
     await callback.answer()
 
 
@@ -549,34 +616,16 @@ async def edit_callback(callback: CallbackQuery):
 async def delete_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
     song = get_song(song_id)
-
     if not song:
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="بله، حذف شود",
-                    callback_data=f"confirmdelete:{song_id}",
-                ),
-                InlineKeyboardButton(
-                    text="لغو",
-                    callback_data=f"song:{song_id}",
-                ),
-            ]
-        ]
-    )
-
-    await callback.message.answer(
-        "این آهنگ و تمام نسخه‌هایش حذف می‌شوند. مطمئنی؟",
-        reply_markup=keyboard,
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [button("بله، حذف شود", callback_data=f"confirmdelete:{song_id}", style="danger"), button("لغو", callback_data=f"song:{song_id}")]
+    ])
+    await callback.message.answer("این آهنگ، نسخه‌ها و آمار دانلودش حذف می‌شوند. مطمئنی؟", reply_markup=keyboard)
     await callback.answer()
 
 
@@ -584,131 +633,91 @@ async def delete_callback(callback: CallbackQuery):
 async def confirm_delete_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
     song_id = int(callback.data.split(":")[1])
     song = get_song(song_id)
-
     if not song:
         await callback.message.answer("آهنگ پیدا نشد.")
         await callback.answer()
         return
-
     if song["channel_message_id"]:
         try:
-            await bot.delete_message(
-                chat_id=CHANNEL_ID,
-                message_id=song["channel_message_id"],
-            )
+            await bot.delete_message(chat_id=CHANNEL_ID, message_id=song["channel_message_id"])
         except Exception:
             logging.exception("Could not delete channel message")
-
     with closing(get_db()) as conn:
         conn.execute("DELETE FROM songs WHERE id = ?", (song_id,))
         conn.commit()
-
-    await callback.message.answer(
-        "آهنگ حذف شد.",
-        reply_markup=admin_menu(),
-    )
+    await callback.message.answer("آهنگ حذف شد.", reply_markup=admin_menu())
     await callback.answer()
 
 
 @dp.message(F.from_user.id == ADMIN_ID)
 async def admin_message_handler(message: Message):
     state = admin_state.get(ADMIN_ID)
-
     if not state:
-        await message.answer(
-            "پنل مدیریت:",
-            reply_markup=admin_menu(),
-        )
+        await message.answer("پنل مدیریت:", reply_markup=admin_menu())
         return
 
     action = state["action"]
     step = state["step"]
     data = state["data"]
 
-    if action == "search":
-        if step == "query":
-            clear_state()
-            await show_search_results(message, message.text or "")
+    if action == "search" and step == "query":
+        clear_state()
+        await show_search_results(message, message.text or "")
         return
 
     if action == "publish":
         if step == "title":
             if not message.text or not message.text.strip():
-                await message.answer("نام آهنگ را به‌صورت متن ارسال کن.")
+                await message.answer("نام را به‌صورت متن بفرست یا از «خالی بگذار» استفاده کن.")
                 return
             data["title"] = message.text.strip()
             state["step"] = "artist"
-            await message.answer("نام خواننده را ارسال کن:")
+            await message.answer("نام خواننده را ارسال کن یا خالی بگذار:", reply_markup=skip_keyboard("publish_skip_artist"))
             return
-
         if step == "artist":
             if not message.text or not message.text.strip():
-                await message.answer("نام خواننده را به‌صورت متن ارسال کن.")
+                await message.answer("نام را به‌صورت متن بفرست یا از «خالی بگذار» استفاده کن.")
                 return
             data["artist"] = message.text.strip()
             state["step"] = "full"
-            await message.answer("فایل کامل آهنگ را ارسال کن:")
+            await message.answer("فایل کامل را ارسال کن. Audio، Voice، Video یا Document:")
             return
-
         if step == "full":
-            file_id = file_id_from_message(message)
-            if not file_id:
-                await message.answer("فایل کامل را به‌صورت Audio یا Document ارسال کن.")
+            media = media_from_message(message)
+            if not media:
+                await message.answer("فایل کامل را به‌صورت Audio، Voice، Video یا Document ارسال کن.")
                 return
-            data["full_file_id"] = file_id
+            data["full_file_id"], data["full_file_type"] = media
             state["step"] = "preview"
-            await message.answer("حالا فایل Preview را ارسال کن:")
+            await message.answer("فایل نمایشی کانال را ارسال کن. Audio، Voice، Video یا Document:")
             return
-
         if step == "preview":
-            preview_id = file_id_from_message(message)
-            if not preview_id:
-                await message.answer("فایل Preview را به‌صورت Audio یا Document ارسال کن.")
+            media = media_from_message(message)
+            if not media:
+                await message.answer("فایل نمایشی را به‌صورت Audio، Voice، Video یا Document ارسال کن.")
                 return
-
-            title = data["title"]
-            artist = data["artist"]
-            full_id = data["full_file_id"]
-
+            preview_id, preview_type = media
             with closing(get_db()) as conn:
-                cur = conn.execute(
-                    "INSERT INTO songs(title, artist) VALUES (?, ?)",
-                    (title, artist),
-                )
+                cur = conn.execute("INSERT INTO songs(title, artist) VALUES (?, ?)", (data.get("title", ""), data.get("artist", "")))
                 song_id = cur.lastrowid
-                conn.execute(
-                    """
-                    INSERT INTO versions(song_id, version_no, file_id, preview_file_id)
-                    VALUES (?, 1, ?, ?)
-                    """,
-                    (song_id, full_id, preview_id),
-                )
+                conn.execute("""
+                    INSERT INTO versions(song_id, version_no, file_id, file_type, preview_file_id, preview_type)
+                    VALUES (?, 1, ?, ?, ?, ?)
+                """, (song_id, data["full_file_id"], data["full_file_type"], preview_id, preview_type))
                 conn.commit()
-
             clear_state()
-
             try:
-                await publish_preview(song_id, preview_id)
+                await publish_preview(song_id, preview_id, preview_type)
             except Exception:
                 with closing(get_db()) as conn:
                     conn.execute("DELETE FROM songs WHERE id = ?", (song_id,))
                     conn.commit()
                 logging.exception("Publishing failed")
-                await message.answer(
-                    "ذخیره انجام نشد چون انتشار در کانال شکست خورد. "
-                    "دسترسی ربات به کانال و دسترسی ارسال پیام را بررسی کن.",
-                    reply_markup=admin_menu(),
-                )
+                await message.answer("انتشار در کانال شکست خورد. دسترسی ادمین ربات به کانال را بررسی کن.", reply_markup=admin_menu())
                 return
-
-            await message.answer(
-                f"آهنگ منتشر شد.\n\nکد آهنگ: <code>{song_id}</code>",
-                parse_mode="HTML",
-                reply_markup=song_menu(song_id),
-            )
+            await message.answer(f"آهنگ منتشر شد.\n\nکد آهنگ: <code>{song_id}</code>", parse_mode="HTML", reply_markup=song_menu(song_id))
             return
 
     if action == "replace":
@@ -716,138 +725,79 @@ async def admin_message_handler(message: Message):
             if not message.text or not message.text.strip().isdigit():
                 await message.answer("شماره نسخه را به‌صورت عدد ارسال کن.")
                 return
-
             version_no = int(message.text.strip())
             song_id = data["song_id"]
-
             if not get_version(song_id, version_no):
-                await message.answer("این نسخه وجود ندارد. شماره نسخه را درست وارد کن.")
+                await message.answer("این نسخه وجود ندارد.")
                 return
-
             data["version_no"] = version_no
             state["step"] = "file"
-            await message.answer("فایل کامل جدید را ارسال کن:")
+            await message.answer("فایل کامل جدید را ارسال کن. Audio، Voice، Video یا Document:")
             return
-
         if step == "file":
-            file_id = file_id_from_message(message)
-            if not file_id:
-                await message.answer("فایل را به‌صورت Audio یا Document ارسال کن.")
+            media = media_from_message(message)
+            if not media:
+                await message.answer("فایل را به‌صورت Audio، Voice، Video یا Document ارسال کن.")
                 return
-
-            song_id = data["song_id"]
-            version_no = data["version_no"]
-
+            file_id, file_type = media
             with closing(get_db()) as conn:
-                conn.execute(
-                    """
-                    UPDATE versions
-                    SET file_id = ?
-                    WHERE song_id = ? AND version_no = ?
-                    """,
-                    (file_id, song_id, version_no),
-                )
+                conn.execute("UPDATE versions SET file_id = ?, file_type = ? WHERE song_id = ? AND version_no = ?", (file_id, file_type, data["song_id"], data["version_no"]))
                 conn.commit()
-
+            song_id, version_no = data["song_id"], data["version_no"]
             clear_state()
-
-            await message.answer(
-                f"فایل نسخه {version_no} جایگزین شد.\n"
-                "لینک قبلی همچنان معتبر است و پست کانال هم تغییر نکرد.",
-                reply_markup=song_menu(song_id),
-            )
+            await message.answer(f"فایل نسخه {version_no} جایگزین شد. لینک قبلی همچنان معتبر است.", reply_markup=song_menu(song_id))
             return
 
     if action == "add_version":
         song_id = data["song_id"]
         version_no = data["version_no"]
-
         if step == "full":
-            file_id = file_id_from_message(message)
-            if not file_id:
+            media = media_from_message(message)
+            if not media:
                 await message.answer("فایل کامل را ارسال کن.")
                 return
-
-            data["full_file_id"] = file_id
+            data["full_file_id"], data["full_file_type"] = media
             state["step"] = "preview"
-            await message.answer(
-                f"فایل Preview نسخه {version_no} را ارسال کن:"
-            )
+            await message.answer(f"فایل نمایشی نسخه {version_no} را ارسال کن:")
             return
-
         if step == "preview":
-            preview_id = file_id_from_message(message)
-            if not preview_id:
-                await message.answer("فایل Preview را ارسال کن.")
+            media = media_from_message(message)
+            if not media:
+                await message.answer("فایل نمایشی را ارسال کن.")
                 return
-
+            preview_id, preview_type = media
             with closing(get_db()) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO versions(song_id, version_no, file_id, preview_file_id)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        song_id,
-                        version_no,
-                        data["full_file_id"],
-                        preview_id,
-                    ),
-                )
+                conn.execute("""
+                    INSERT INTO versions(song_id, version_no, file_id, file_type, preview_file_id, preview_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (song_id, version_no, data["full_file_id"], data["full_file_type"], preview_id, preview_type))
                 conn.commit()
-
             clear_state()
-
-            try:
-                await update_channel_post(song_id)
-            except Exception:
-                logging.exception("Could not update channel post")
-
-            await message.answer(
-                f"نسخه {version_no} اضافه شد و لینک‌های پست کانال به‌روزرسانی شدند.",
-                reply_markup=song_menu(song_id),
-            )
+            await update_channel_post(song_id)
+            await message.answer(f"نسخه {version_no} اضافه شد و لینک‌های پست کانال به‌روزرسانی شدند.", reply_markup=song_menu(song_id))
             return
 
     if action == "edit":
         song_id = data["song_id"]
-
         if step == "title":
             if not message.text or not message.text.strip():
-                await message.answer("نام آهنگ را ارسال کن.")
+                await message.answer("نام را به‌صورت متن بفرست یا «خالی بگذار» را بزن.")
                 return
-
             data["title"] = message.text.strip()
             state["step"] = "artist"
-            await message.answer("نام جدید خواننده را ارسال کن:")
+            await message.answer("نام جدید خواننده را ارسال کن یا خالی بگذار:", reply_markup=skip_keyboard("edit_skip_artist"))
             return
-
         if step == "artist":
             if not message.text or not message.text.strip():
-                await message.answer("نام خواننده را ارسال کن.")
+                await message.answer("نام را به‌صورت متن بفرست یا «خالی بگذار» را بزن.")
                 return
-
             data["artist"] = message.text.strip()
-
             with closing(get_db()) as conn:
-                conn.execute(
-                    """
-                    UPDATE songs
-                    SET title = ?, artist = ?
-                    WHERE id = ?
-                    """,
-                    (data["title"], data["artist"], song_id),
-                )
+                conn.execute("UPDATE songs SET title = ?, artist = ? WHERE id = ?", (data["title"], data["artist"], song_id))
                 conn.commit()
-
             clear_state()
-
             await update_channel_post(song_id)
-
-            await message.answer(
-                "اطلاعات آهنگ و متن پست کانال به‌روزرسانی شد.",
-                reply_markup=song_menu(song_id),
-            )
+            await message.answer("اطلاعات آهنگ و پست کانال به‌روزرسانی شد.", reply_markup=song_menu(song_id))
             return
 
 
