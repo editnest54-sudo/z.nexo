@@ -63,66 +63,100 @@ db.execute("PRAGMA foreign_keys = ON")
 def now():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def init_db():
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS songs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            artist TEXT,
-            channel_message_id INTEGER,
-            created_at TEXT
-        );
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS songs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        artist TEXT,
+        channel_message_id INTEGER,
+        created_at TEXT
+    );
 
-        CREATE TABLE IF NOT EXISTS versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            song_id INTEGER NOT NULL,
-            version_no INTEGER NOT NULL,
-            file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            preview_file_id TEXT NOT NULL,
-            preview_type TEXT NOT NULL,
-            downloads INTEGER DEFAULT 0,
-            created_at TEXT,
-            FOREIGN KEY(song_id) REFERENCES songs(id) ON DELETE CASCADE,
-            UNIQUE(song_id, version_no)
-        );
+    CREATE TABLE IF NOT EXISTS versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        song_id INTEGER NOT NULL,
+        version_no INTEGER NOT NULL,
+        file_id TEXT NOT NULL,
+        file_type TEXT DEFAULT 'document',
+        preview_file_id TEXT NOT NULL,
+        preview_type TEXT DEFAULT 'document',
+        downloads INTEGER DEFAULT 0,
+        created_at TEXT,
+        FOREIGN KEY(song_id) REFERENCES songs(id) ON DELETE CASCADE,
+        UNIQUE(song_id, version_no)
+    );
 
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_seen TEXT
-        );
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY
+    );
 
-        CREATE TABLE IF NOT EXISTS download_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            song_id INTEGER,
-            version_no INTEGER,
-            created_at TEXT
-        );
-        """
-    )
+    CREATE TABLE IF NOT EXISTS download_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        song_id INTEGER,
+        version_no INTEGER,
+        created_at TEXT
+    );
+    """)
 
-    # Migration برای دیتابیس‌های قدیمی
-    columns = [
+    # -------- users migration --------
+    user_columns = [
+        row["name"]
+        for row in db.execute("PRAGMA table_info(users)").fetchall()
+    ]
+
+    if "first_seen" not in user_columns:
+        db.execute(
+            "ALTER TABLE users ADD COLUMN first_seen TEXT"
+        )
+
+    # -------- versions migration --------
+    version_columns = [
         row["name"]
         for row in db.execute("PRAGMA table_info(versions)").fetchall()
     ]
 
-    if "file_type" not in columns:
+    if "file_type" not in version_columns:
         db.execute(
             "ALTER TABLE versions ADD COLUMN file_type TEXT DEFAULT 'document'"
         )
 
-    if "preview_type" not in columns:
+    if "preview_type" not in version_columns:
         db.execute(
             "ALTER TABLE versions ADD COLUMN preview_type TEXT DEFAULT 'document'"
         )
 
-    if "downloads" not in columns:
+    if "downloads" not in version_columns:
         db.execute(
             "ALTER TABLE versions ADD COLUMN downloads INTEGER DEFAULT 0"
+        )
+
+    # -------- songs migration --------
+    song_columns = [
+        row["name"]
+        for row in db.execute("PRAGMA table_info(songs)").fetchall()
+    ]
+
+    if "channel_message_id" not in song_columns:
+        db.execute(
+            "ALTER TABLE songs ADD COLUMN channel_message_id INTEGER"
+        )
+
+    if "created_at" not in song_columns:
+        db.execute(
+            "ALTER TABLE songs ADD COLUMN created_at TEXT"
+        )
+
+    # -------- download_logs migration --------
+    log_columns = [
+        row["name"]
+        for row in db.execute("PRAGMA table_info(download_logs)").fetchall()
+    ]
+
+    if "created_at" not in log_columns:
+        db.execute(
+            "ALTER TABLE download_logs ADD COLUMN created_at TEXT"
         )
 
     db.commit()
