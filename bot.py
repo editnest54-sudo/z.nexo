@@ -5,10 +5,12 @@ import os
 import re
 import sqlite3
 from contextlib import closing
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.filters import CommandStart, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
+from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,6 +21,8 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 DB_NAME = os.getenv("DB_NAME", "music_bot.db")
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
+LEAVE_LOG_GROUP_ID = int(os.getenv("LEAVE_LOG_GROUP_ID", "0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -86,6 +90,21 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER PRIMARY KEY,
+                blocked_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Migrate databases created by the older project version.
         song_cols = {r["name"] for r in conn.execute("PRAGMA table_info(songs)").fetchall()}
         if "title" not in song_cols:
@@ -124,6 +143,9 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [button("➕ انتشار آهنگ", callback_data="publish", style="success")],
         [button("🔍 جستجو", callback_data="search", style="primary"), button("📊 آمار", callback_data="stats", style="primary")],
+        [button("📈 آمار زمانی", callback_data="stats_period", style="primary")],
+        [button("📣 پیام همگانی", callback_data="broadcast", style="success")],
+        [button("🚫 بلاک کاربر", callback_data="block_user", style="danger"), button("✅ آنبلاک کاربر", callback_data="unblock_user", style="success")],
     ])
 
 
@@ -353,6 +375,9 @@ async def deliver_pending_song(user_id: int, chat_id: int, song_id: int, version
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     remember_user(message.from_user.id)
+    if not is_admin(message.from_user.id) and is_blocked(message.from_user.id):
+        await message.answer("دسترسی شما به ربات محدود شده است.")
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) == 1:
         if is_admin(message.from_user.id):
@@ -377,6 +402,9 @@ async def start_handler(message: Message):
 @dp.callback_query(F.data == "check_membership")
 async def check_membership_callback(callback: CallbackQuery):
     remember_user(callback.from_user.id)
+    if not is_admin(callback.from_user.id) and is_blocked(callback.from_user.id):
+        await callback.answer("دسترسی شما به ربات محدود شده است.", show_alert=True)
+        return
     if not await is_channel_member(callback.from_user.id):
         await callback.answer("هنوز عضویت شما تأیید نشد.", show_alert=True)
         return
@@ -662,6 +690,39 @@ async def admin_message_handler(message: Message):
     step = state["step"]
     data = state["data"]
 
+    if action == "broadcast" and step == "message":
+        data["from_chat_id"] = message.chat.id
+        data["message_id"] = message.message_id
+        state["step"] = "confirm"
+        total = len(broadcast_recipients())
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [button(f"✅ ارسال برای {total} نفر", callback_data="broadcast_confirm", style="success")],
+            [button("❌ لغو", callback_data="cancel", style="danger")],
+        ])
+        await message.answer("پیام بالا برای همه کاربران ارسال می‌شود. تأیید می‌کنی؟", reply_markup=keyboard)
+        return
+
+    if action in ("block", "unblock") and step == "user":
+        text = (message.text or "").strip()
+        if not text.isdigit():
+            await message.answer("آیدی عددی کاربر را به‌صورت عدد ارسال کن.")
+            return
+        target = int(text)
+        if target == ADMIN_ID:
+            await message.answer("نمی‌توانی ادمین را بلاک کنی.")
+            return
+        clear_state()
+        with closing(get_db()) as conn:
+            if action == "block":
+                conn.execute("INSERT OR IGNORE INTO blocked_users(user_id) VALUES (?)", (target,))
+                result = f"کاربر <code>{target}</code> بلاک شد."
+            else:
+                cur = conn.execute("DELETE FROM blocked_users WHERE user_id = ?", (target,))
+                result = f"کاربر <code>{target}</code> آنبلاک شد." if cur.rowcount else "این کاربر در لیست بلاک نبود."
+            conn.commit()
+        await message.answer(result, parse_mode="HTML", reply_markup=admin_menu())
+        return
+
     if action == "search" and step == "query":
         clear_state()
         await show_search_results(message, message.text or "")
@@ -801,10 +862,197 @@ async def admin_message_handler(message: Message):
             return
 
 
+@dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def channel_join_log_handler(event: ChatMemberUpdated):
+    if event.chat.id != CHANNEL_ID:
+        return
+    user = event.new_chat_member.user
+    if user.is_bot:
+        return
+
+    full_name = " ".join(p for p in (user.first_name, user.last_name) if p) or "بدون نام"
+    username = f"@{user.username}" if user.username else "ندارد"
+    invite = getattr(event, "invite_link", None)
+    if invite:
+        invite_text = invite.name or invite.invite_link
+    else:
+        invite_text = "نامشخص"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    record_channel_event(user.id, "join")
+    logging.info("Channel join | user_id=%s | username=%s | name=%s | invite=%s", user.id, username, full_name, invite_text)
+    try:
+        await bot.send_message(
+            LOG_GROUP_ID or ADMIN_ID,
+            f"✅ <b>عضو جدید در کانال</b>\n\n"
+            f"👤 نام: {html.escape(full_name)}\n"
+            f"🔗 یوزرنیم: {html.escape(username)}\n"
+            f"🆔 آیدی: <code>{user.id}</code>\n"
+            f"📨 لینک دعوت: {html.escape(str(invite_text))}\n"
+            f"🕒 زمان: {now}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception("Could not send join log")
+
+
+def is_blocked(user_id: int) -> bool:
+    with closing(get_db()) as conn:
+        return conn.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+
+def record_channel_event(user_id: int, event: str):
+    with closing(get_db()) as conn:
+        conn.execute("INSERT INTO channel_events(user_id, event) VALUES (?, ?)", (user_id, event))
+        conn.commit()
+
+
+def broadcast_recipients() -> list[int]:
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users WHERE user_id != ? AND user_id NOT IN (SELECT user_id FROM blocked_users)",
+            (ADMIN_ID,),
+        ).fetchall()
+    return [r["user_id"] for r in rows]
+
+
+@dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
+async def channel_leave_log_handler(event: ChatMemberUpdated):
+    if event.chat.id != CHANNEL_ID:
+        return
+    user = event.new_chat_member.user
+    if user.is_bot:
+        return
+
+    full_name = " ".join(p for p in (user.first_name, user.last_name) if p) or "بدون نام"
+    username = f"@{user.username}" if user.username else "ندارد"
+    banned = event.new_chat_member.status == "kicked"
+    title = "⛔️ <b>کاربر از کانال بن شد</b>" if banned else "🚪 <b>خروج از کانال</b>"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    record_channel_event(user.id, "leave")
+    logging.info("Channel leave | user_id=%s | username=%s | name=%s | banned=%s", user.id, username, full_name, banned)
+    try:
+        await bot.send_message(
+            LEAVE_LOG_GROUP_ID or LOG_GROUP_ID or ADMIN_ID,
+            f"{title}\n\n"
+            f"👤 نام: {html.escape(full_name)}\n"
+            f"🔗 یوزرنیم: {html.escape(username)}\n"
+            f"🆔 آیدی: <code>{user.id}</code>\n"
+            f"🕒 زمان: {now}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception("Could not send leave log")
+
+
+@dp.callback_query(F.data == "stats_period")
+async def stats_period_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    def period(days: int) -> dict:
+        since = f"-{days} days"
+        with closing(get_db()) as conn:
+            return {
+                "users": conn.execute("SELECT COUNT(*) FROM users WHERE first_seen_at >= datetime('now', ?)", (since,)).fetchone()[0],
+                "downloads": conn.execute("SELECT COUNT(*) FROM download_stats WHERE created_at >= datetime('now', ?)", (since,)).fetchone()[0],
+                "joins": conn.execute("SELECT COUNT(*) FROM channel_events WHERE event = 'join' AND created_at >= datetime('now', ?)", (since,)).fetchone()[0],
+                "leaves": conn.execute("SELECT COUNT(*) FROM channel_events WHERE event = 'leave' AND created_at >= datetime('now', ?)", (since,)).fetchone()[0],
+            }
+
+    day, week = period(1), period(7)
+    with closing(get_db()) as conn:
+        blocked = conn.execute("SELECT COUNT(*) FROM blocked_users").fetchone()[0]
+
+    def block(title: str, d: dict) -> str:
+        return (
+            f"<b>{title}</b>\n"
+            f"👤 کاربران جدید ربات: {d['users']}\n"
+            f"⬇️ درخواست‌های دانلود: {d['downloads']}\n"
+            f"✅ ورود به کانال: {d['joins']}\n"
+            f"🚪 خروج از کانال: {d['leaves']}\n"
+            f"📊 تغییر خالص اعضا: {d['joins'] - d['leaves']:+d}"
+        )
+
+    await callback.message.answer(
+        f"📈 <b>آمار زمانی</b>\n\n{block('۲۴ ساعت اخیر', day)}\n\n{block('۷ روز اخیر', week)}\n\n🚫 کاربران بلاک‌شده: {blocked}",
+        parse_mode="HTML",
+        reply_markup=admin_menu(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "broadcast")
+async def broadcast_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    admin_state[ADMIN_ID] = {"action": "broadcast", "step": "message", "data": {}}
+    await callback.message.answer("پیامی که می‌خواهی برای همه کاربران ارسال شود را بفرست (متن، عکس، فایل و ...):", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "broadcast_confirm")
+async def broadcast_confirm_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "broadcast" or state.get("step") != "confirm":
+        await callback.answer("درخواستی برای ارسال وجود ندارد.", show_alert=True)
+        return
+    from_chat_id = state["data"]["from_chat_id"]
+    message_id = state["data"]["message_id"]
+    clear_state()
+    await callback.answer("ارسال شروع شد.")
+    await callback.message.answer("⏳ ارسال شروع شد. بعد از پایان گزارش می‌دهم.")
+
+    recipients = broadcast_recipients()
+    sent = failed = 0
+    for uid in recipients:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+            sent += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    logging.info("Broadcast finished | total=%s | sent=%s | failed=%s", len(recipients), sent, failed)
+    await callback.message.answer(
+        f"📣 <b>گزارش پیام همگانی</b>\n\n👥 کل: {len(recipients)}\n✅ موفق: {sent}\n❌ ناموفق: {failed}",
+        parse_mode="HTML",
+        reply_markup=admin_menu(),
+    )
+
+
+@dp.callback_query(F.data == "block_user")
+async def block_user_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    admin_state[ADMIN_ID] = {"action": "block", "step": "user", "data": {}}
+    await callback.message.answer("آیدی عددی کاربری که می‌خواهی بلاک شود را ارسال کن:", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "unblock_user")
+async def unblock_user_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    admin_state[ADMIN_ID] = {"action": "unblock", "step": "user", "data": {}}
+    await callback.message.answer("آیدی عددی کاربری که می‌خواهی آنبلاک شود را ارسال کن:", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
 async def main():
     init_db()
     logging.info("Music bot started")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
