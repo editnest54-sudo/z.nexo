@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramRetryAfter
@@ -123,6 +123,16 @@ def init_db():
         # constraint in place, but existing rows already have values. New rows use
         # empty strings when a field is intentionally left blank.
         conn.commit()
+
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def tehran_time(dt: datetime | None = None) -> str:
+    dt = dt or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -365,7 +375,7 @@ async def log_download(user_id: int, song_id: int, version_no: int):
             song = conn.execute("SELECT title, artist FROM songs WHERE id = ?", (song_id,)).fetchone()
         title = ((song["title"] if song else "") or "").strip() or "بدون عنوان"
         artist = ((song["artist"] if song else "") or "").strip()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = tehran_time()
 
         logging.info("Download | user_id=%s | username=%s | song=A%04d | version=%s", user_id, username, song_id, version_no)
         await bot.send_message(
@@ -912,7 +922,7 @@ async def channel_join_log_handler(event: ChatMemberUpdated):
         invite_text = invite.name or invite.invite_link
     else:
         invite_text = "نامشخص"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = tehran_time(event.date)
 
     record_channel_event(user.id, "join")
     logging.info("Channel join | user_id=%s | username=%s | name=%s | invite=%s", user.id, username, full_name, invite_text)
@@ -963,7 +973,7 @@ async def channel_leave_log_handler(event: ChatMemberUpdated):
     username = f"@{user.username}" if user.username else "ندارد"
     banned = event.new_chat_member.status == "kicked"
     title = "⛔️ <b>کاربر از کانال بن شد</b>" if banned else "🚪 <b>خروج از کانال</b>"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = tehran_time(event.date)
 
     record_channel_event(user.id, "leave")
     logging.info("Channel leave | user_id=%s | username=%s | name=%s | banned=%s", user.id, username, full_name, banned)
