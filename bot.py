@@ -23,6 +23,7 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 DB_NAME = os.getenv("DB_NAME", "music_bot.db")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
 LEAVE_LOG_GROUP_ID = int(os.getenv("LEAVE_LOG_GROUP_ID", "0"))
+DOWNLOAD_LOG_GROUP_ID = int(os.getenv("DOWNLOAD_LOG_GROUP_ID", "0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -351,6 +352,38 @@ async def send_requested_file(chat_id: int, version):
     return await bot.send_document(**kwargs)
 
 
+async def log_download(user_id: int, song_id: int, version_no: int):
+    try:
+        try:
+            chat = await bot.get_chat(user_id)
+            full_name = " ".join(p for p in (chat.first_name, chat.last_name) if p) or "بدون نام"
+            username = f"@{chat.username}" if chat.username else "ندارد"
+        except Exception:
+            full_name, username = "نامشخص", "نامشخص"
+
+        with closing(get_db()) as conn:
+            song = conn.execute("SELECT title, artist FROM songs WHERE id = ?", (song_id,)).fetchone()
+        title = ((song["title"] if song else "") or "").strip() or "بدون عنوان"
+        artist = ((song["artist"] if song else "") or "").strip()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        logging.info("Download | user_id=%s | username=%s | song=A%04d | version=%s", user_id, username, song_id, version_no)
+        await bot.send_message(
+            DOWNLOAD_LOG_GROUP_ID or LOG_GROUP_ID or ADMIN_ID,
+            f"⬇️ <b>دانلود آهنگ</b>\n\n"
+            f"🎵 آهنگ: {html.escape(title)}\n"
+            + (f"🎤 خواننده: {html.escape(artist)}\n" if artist else "")
+            + f"🔖 کد: A{song_id:04d} | نسخه {version_no}\n\n"
+            f"👤 نام: {html.escape(full_name)}\n"
+            f"🔗 یوزرنیم: {html.escape(username)}\n"
+            f"🆔 آیدی: <code>{user_id}</code>\n"
+            f"🕒 زمان: {now}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception("Could not send download log")
+
+
 async def deliver_pending_song(user_id: int, chat_id: int, song_id: int, version_no: int) -> bool:
     version = get_version(song_id, version_no)
     if not version:
@@ -370,6 +403,7 @@ async def deliver_pending_song(user_id: int, chat_id: int, song_id: int, version
         return False
     await send_requested_file(chat_id, version)
     record_download(song_id, version_no, user_id)
+    await log_download(user_id, song_id, version_no)
     return True
 
 
