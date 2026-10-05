@@ -4,13 +4,15 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
+import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import CommandStart, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
-from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -112,6 +114,9 @@ def init_db():
             conn.execute("ALTER TABLE songs ADD COLUMN title TEXT")
         if "artist" not in song_cols:
             conn.execute("ALTER TABLE songs ADD COLUMN artist TEXT")
+        if "code" not in song_cols:
+            conn.execute("ALTER TABLE songs ADD COLUMN code TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_songs_code ON songs(code)")
 
         version_cols = {r["name"] for r in conn.execute("PRAGMA table_info(versions)").fetchall()}
         if "file_type" not in version_cols:
@@ -133,6 +138,10 @@ def tehran_time(dt: datetime | None = None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def song_code(song_id: int, code: str | None = None) -> str:
+    return code or f"A{song_id:04d}"
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -157,6 +166,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [button("📈 آمار زمانی", callback_data="stats_period", style="primary")],
         [button("📣 پیام همگانی", callback_data="broadcast", style="success")],
         [button("🚫 بلاک کاربر", callback_data="block_user", style="danger"), button("✅ آنبلاک کاربر", callback_data="unblock_user", style="success")],
+        [button("💾 بکاپ آهنگ‌ها", callback_data="backup_songs", style="primary")],
     ])
 
 
@@ -225,7 +235,7 @@ def build_links(song_id: int) -> str:
 
 def build_caption(song_id: int) -> str:
     with closing(get_db()) as conn:
-        song = conn.execute("SELECT title, artist FROM songs WHERE id = ?", (song_id,)).fetchone()
+        song = conn.execute("SELECT title, artist, code FROM songs WHERE id = ?", (song_id,)).fetchone()
     if not song:
         return "دانلود آهنگ کامل"
 
@@ -236,7 +246,7 @@ def build_caption(song_id: int) -> str:
         lines.append(f"🎵 <b>{html.escape(title)}</b>")
     if artist:
         lines.append(f"👤 {html.escape(artist)}")
-    lines.append(f"code: A{song_id:04d}")
+    lines.append(f"code: {song_code(song_id, song['code'])}")
     if lines:
         lines.append("")
     lines.append(build_links(song_id))
@@ -301,7 +311,7 @@ def format_song(song_id: int) -> str:
     return (
         f"🎵 <b>{html.escape(title)}</b>\n"
         f"👤 {html.escape(artist)}\n"
-        f"🆔 کد: <code>{song_id}</code>\n"
+        f"🆔 کد: <code>{song_code(song_id, song['code'])}</code>\n"
         f"🎚 نسخه‌ها: {version_text}\n"
         f"⬇️ درخواست دانلود: {downloads}"
     )
@@ -372,18 +382,19 @@ async def log_download(user_id: int, song_id: int, version_no: int):
             full_name, username = "نامشخص", "نامشخص"
 
         with closing(get_db()) as conn:
-            song = conn.execute("SELECT title, artist FROM songs WHERE id = ?", (song_id,)).fetchone()
+            song = conn.execute("SELECT title, artist, code FROM songs WHERE id = ?", (song_id,)).fetchone()
+        code = song_code(song_id, song["code"] if song else None)
         title = ((song["title"] if song else "") or "").strip() or "بدون عنوان"
         artist = ((song["artist"] if song else "") or "").strip()
         now = tehran_time()
 
-        logging.info("Download | user_id=%s | username=%s | song=A%04d | version=%s", user_id, username, song_id, version_no)
+        logging.info("Download | user_id=%s | username=%s | song=%s | version=%s", user_id, username, code, version_no)
         await bot.send_message(
             DOWNLOAD_LOG_GROUP_ID or LOG_GROUP_ID or ADMIN_ID,
             f"⬇️ <b>دانلود آهنگ</b>\n\n"
             f"🎵 آهنگ: {html.escape(title)}\n"
             + (f"🎤 خواننده: {html.escape(artist)}\n" if artist else "")
-            + f"🔖 کد: A{song_id:04d} | نسخه {version_no}\n\n"
+            + f"🔖 کد: {code} | نسخه {version_no}\n\n"
             f"👤 نام: {html.escape(full_name)}\n"
             f"🔗 یوزرنیم: {html.escape(username)}\n"
             f"🆔 آیدی: <code>{user_id}</code>\n"
@@ -575,7 +586,13 @@ async def stats_callback(callback: CallbackQuery):
 async def show_search_results(message: Message, query: str):
     query = query.strip()
     with closing(get_db()) as conn:
-        if query.isdigit():
+        code_query = query.upper()
+        if re.fullmatch(r"[A-Z][0-9]+", code_query):
+            rows = conn.execute(
+                "SELECT id, title, artist FROM songs WHERE code = ? OR (code IS NULL AND 'A' || printf('%04d', id) = ?) LIMIT 10",
+                (code_query, code_query),
+            ).fetchall()
+        elif query.isdigit():
             rows = conn.execute("SELECT id, title, artist FROM songs WHERE id = ? LIMIT 10", (int(query),)).fetchall()
         else:
             like = f"%{query}%"
@@ -804,15 +821,33 @@ async def admin_message_handler(message: Message):
             if not media:
                 await message.answer("فایل نمایشی را به‌صورت Audio، Voice، Video یا Document ارسال کن.")
                 return
-            preview_id, preview_type = media
-            with closing(get_db()) as conn:
-                cur = conn.execute("INSERT INTO songs(title, artist) VALUES (?, ?)", (data.get("title", ""), data.get("artist", "")))
-                song_id = cur.lastrowid
-                conn.execute("""
-                    INSERT INTO versions(song_id, version_no, file_id, file_type, preview_file_id, preview_type)
-                    VALUES (?, 1, ?, ?, ?, ?)
-                """, (song_id, data["full_file_id"], data["full_file_type"], preview_id, preview_type))
-                conn.commit()
+            data["preview_id"], data["preview_type"] = media
+            state["step"] = "code"
+            await message.answer(
+                "کد آهنگ را بفرست. فقط یک حرف بزرگ انگلیسی و بعدش عدد، مثل A25 یا B0007:",
+                reply_markup=cancel_keyboard(),
+            )
+            return
+        if step == "code":
+            code = (message.text or "").strip()
+            if not re.fullmatch(r"[A-Z][0-9]+", code):
+                await message.answer("کد نامعتبر است. فقط یک حرف بزرگ انگلیسی و بعدش عدد بنویس، مثل A25 یا B0007.")
+                return
+            preview_id, preview_type = data["preview_id"], data["preview_type"]
+            try:
+                with closing(get_db()) as conn:
+                    if conn.execute("SELECT 1 FROM songs WHERE code = ?", (code,)).fetchone():
+                        raise sqlite3.IntegrityError("duplicate code")
+                    cur = conn.execute("INSERT INTO songs(title, artist, code) VALUES (?, ?, ?)", (data.get("title", ""), data.get("artist", ""), code))
+                    song_id = cur.lastrowid
+                    conn.execute("""
+                        INSERT INTO versions(song_id, version_no, file_id, file_type, preview_file_id, preview_type)
+                        VALUES (?, 1, ?, ?, ?, ?)
+                    """, (song_id, data["full_file_id"], data["full_file_type"], preview_id, preview_type))
+                    conn.commit()
+            except sqlite3.IntegrityError:
+                await message.answer("این کد قبلاً برای آهنگ دیگری استفاده شده. کد دیگری بفرست.")
+                return
             clear_state()
             try:
                 await publish_preview(song_id, preview_id, preview_type)
@@ -823,7 +858,7 @@ async def admin_message_handler(message: Message):
                 logging.exception("Publishing failed")
                 await message.answer("انتشار در کانال شکست خورد. دسترسی ادمین ربات به کانال را بررسی کن.", reply_markup=admin_menu())
                 return
-            await message.answer(f"آهنگ منتشر شد.\n\nکد آهنگ: <code>{song_id}</code>", parse_mode="HTML", reply_markup=song_menu(song_id))
+            await message.answer(f"آهنگ منتشر شد.\n\nکد آهنگ: <code>{code}</code>", parse_mode="HTML", reply_markup=song_menu(song_id))
             return
 
     if action == "replace":
@@ -1092,6 +1127,133 @@ async def unblock_user_callback(callback: CallbackQuery):
     admin_state[ADMIN_ID] = {"action": "unblock", "step": "user", "data": {}}
     await callback.message.answer("آیدی عددی کاربری که می‌خواهی آنبلاک شود را ارسال کن:", reply_markup=cancel_keyboard())
     await callback.answer()
+
+
+backup_lock = asyncio.Lock()
+BACKUP_PART_LIMIT = 45 * 1024 * 1024
+BACKUP_DEFAULT_EXT = {"audio": ".mp3", "voice": ".ogg", "video": ".mp4", "document": ""}
+
+
+def _backup_safe_name(text: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", text or "").strip()[:60]
+
+
+def _backup_write_zip(zip_path: str, files: list[tuple[str, str]]):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for path, arcname in files:
+            zf.write(path, arcname)
+
+
+@dp.callback_query(F.data == "backup_songs")
+async def backup_songs_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    if backup_lock.locked():
+        await callback.answer("بکاپ در حال انجام است.", show_alert=True)
+        return
+    await callback.answer()
+
+    async with backup_lock:
+        with closing(get_db()) as conn:
+            rows = conn.execute("""
+                SELECT v.song_id, v.version_no, v.file_id, v.file_type, s.title, s.artist, s.code
+                FROM versions v JOIN songs s ON s.id = v.song_id
+                ORDER BY v.song_id, v.version_no
+            """).fetchall()
+        if not rows:
+            await callback.message.answer("هنوز آهنگی ثبت نشده است.", reply_markup=admin_menu())
+            return
+        await callback.message.answer(f"⏳ بکاپ {len(rows)} فایل شروع شد. بعد از آماده شدن، فایل‌های zip پشت‌سرهم ارسال می‌شوند.")
+
+        counts: dict[int, int] = {}
+        for r in rows:
+            counts[r["song_id"]] = counts.get(r["song_id"], 0) + 1
+
+        date_tag = tehran_time()[:10]
+        used_names: set[str] = set()
+        batch: list[tuple[str, str]] = []
+        batch_size = 0
+        part_no = 0
+        saved = 0
+        failed: list[str] = []
+        send_failed: list[int] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+
+            async def flush():
+                nonlocal batch, batch_size, part_no
+                if not batch:
+                    return
+                part_no += 1
+                current_part = part_no
+                files = batch
+                batch, batch_size = [], 0
+                zip_path = os.path.join(tmp, f"backup_{date_tag}_part{current_part}.zip")
+                await asyncio.to_thread(_backup_write_zip, zip_path, files)
+                for path, _ in files:
+                    os.remove(path)
+                sent = False
+                for _attempt in range(2):
+                    try:
+                        await bot.send_document(
+                            ADMIN_ID,
+                            FSInputFile(zip_path),
+                            caption=f"💾 بکاپ آهنگ‌ها - قسمت {current_part} ({len(files)} فایل)",
+                            request_timeout=900,
+                        )
+                        sent = True
+                        break
+                    except TelegramRetryAfter as e:
+                        await asyncio.sleep(e.retry_after)
+                    except Exception:
+                        logging.exception("Could not send backup part %s", current_part)
+                        break
+                if not sent:
+                    send_failed.append(current_part)
+                os.remove(zip_path)
+
+            for i, r in enumerate(rows):
+                code = song_code(r["song_id"], r["code"])
+                label = f"{code} (نسخه {r['version_no']})"
+                try:
+                    tg_file = await bot.get_file(r["file_id"])
+                    ext = os.path.splitext(tg_file.file_path or "")[1] or BACKUP_DEFAULT_EXT.get(r["file_type"], "")
+                    name = " - ".join(p for p in (code, _backup_safe_name(r["title"]), _backup_safe_name(r["artist"])) if p)
+                    if counts[r["song_id"]] > 1:
+                        name += f" (v{r['version_no']})"
+                    arcname = name + ext
+                    n = 2
+                    while arcname.lower() in used_names:
+                        arcname = f"{name} ({n}){ext}"
+                        n += 1
+                    local = os.path.join(tmp, f"{i}{ext}")
+                    await bot.download_file(tg_file.file_path, destination=local, timeout=300)
+                    size = os.path.getsize(local)
+                except Exception:
+                    logging.exception("Backup download failed for %s", label)
+                    failed.append(label)
+                    continue
+                used_names.add(arcname.lower())
+                if batch and batch_size + size > BACKUP_PART_LIMIT:
+                    await flush()
+                batch.append((local, arcname))
+                batch_size += size
+                saved += 1
+            await flush()
+
+        report = (
+            f"💾 <b>گزارش بکاپ</b>\n\n"
+            f"✅ ذخیره‌شده: {saved}\n"
+            f"❌ ناموفق: {len(failed)}\n"
+            f"📦 تعداد فایل zip: {part_no}"
+        )
+        if failed:
+            report += "\n\nناموفق‌ها (معمولاً فایل‌های بالای ۲۰ مگابایت):\n" + "\n".join(failed[:30])
+            if len(failed) > 30:
+                report += f"\nو {len(failed) - 30} مورد دیگر"
+        if send_failed:
+            report += "\n\n⚠️ ارسال این قسمت‌ها ناموفق بود: " + ", ".join(str(n) for n in send_failed)
+        await callback.message.answer(report, parse_mode="HTML", reply_markup=admin_menu())
 
 
 async def main():
