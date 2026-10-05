@@ -4,15 +4,23 @@ import logging
 import os
 import re
 import sqlite3
-import tempfile
-import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import CommandStart, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
-from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    ChatMemberUpdated,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -108,6 +116,14 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_download_stats_song ON download_stats(song_id, created_at)")
+
         # Migrate databases created by the older project version.
         song_cols = {r["name"] for r in conn.execute("PRAGMA table_info(songs)").fetchall()}
         if "title" not in song_cols:
@@ -163,7 +179,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [button("➕ انتشار آهنگ", callback_data="publish", style="success")],
         [button("🔍 جستجو", callback_data="search", style="primary"), button("📊 آمار", callback_data="stats", style="primary")],
-        [button("📈 آمار زمانی", callback_data="stats_period", style="primary")],
+        [button("📈 آمار زمانی", callback_data="stats_period", style="primary"), button("🎧 آمار آهنگ‌ها", callback_data="ss_open", style="primary")],
         [button("📣 پیام همگانی", callback_data="broadcast", style="success")],
         [button("🚫 بلاک کاربر", callback_data="block_user", style="danger"), button("✅ آنبلاک کاربر", callback_data="unblock_user", style="success")],
         [button("💾 بکاپ آهنگ‌ها", callback_data="backup_songs", style="primary")],
@@ -455,6 +471,14 @@ async def start_handler(message: Message):
     await deliver_pending_song(message.from_user.id, message.chat.id, song_id, version_no)
 
 
+@dp.message(Command("panel"))
+async def panel_command_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    clear_state()
+    await message.answer("پنل مدیریت:", reply_markup=admin_menu())
+
+
 @dp.callback_query(F.data == "check_membership")
 async def check_membership_callback(callback: CallbackQuery):
     remember_user(callback.from_user.id)
@@ -606,7 +630,7 @@ async def show_search_results(message: Message, query: str):
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         button(f"{row['title'] or 'بدون نام'} | {row['artist'] or 'بدون خواننده'}", callback_data=f"song:{row['id']}", style="primary")
-    ] for row in rows])
+    ] for row in rows] + [[button("🔙 بازگشت", callback_data="home")]])
     await message.answer("نتایج جستجو:", reply_markup=keyboard)
 
 
@@ -751,6 +775,52 @@ async def admin_message_handler(message: Message):
     action = state["action"]
     step = state["step"]
     data = state["data"]
+
+    if action == "backup":
+        if step == "code":
+            song = find_song_by_code(message.text or "")
+            if not song:
+                await message.answer("این کد پیدا نشد. دوباره بفرست.", reply_markup=back_keyboard("backup_songs"))
+                return
+            data["song_id"] = song["id"]
+            data["code"] = song_code(song["id"], song["code"])
+            state["step"] = "dest"
+            await show_backup_dest(message)
+            return
+        if step == "channel":
+            resolved = await resolve_backup_channel(message)
+            if not resolved:
+                return
+            chat_id, title = resolved
+            set_setting("backup_channel", f"{chat_id}|{title}")
+            data.update(dest_chat_id=chat_id, dest_label=f"کانال {title}", dest_kind="channel")
+            state["step"] = "confirm"
+            await show_backup_confirm(message)
+            return
+        if step == "user":
+            text = (message.text or "").strip()
+            if not text.isdigit():
+                await message.answer("آیدی عددی کاربر را بفرست.", reply_markup=back_keyboard("bk_back_dest"))
+                return
+            data.update(dest_chat_id=int(text), dest_label=f"کاربر {text}", dest_kind="user")
+            state["step"] = "confirm"
+            await show_backup_confirm(message)
+            return
+
+    if action == "song_stats" and step == "code":
+        song = find_song_by_code(message.text or "")
+        if not song:
+            await message.answer("این کد پیدا نشد. دوباره بفرست.", reply_markup=back_keyboard("ss_open"))
+            return
+        clear_state()
+        await message.answer(
+            render_one_song_stats(song),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [button("🔙 بازگشت", callback_data="ss_open"), button("⬅️ پنل مدیریت", callback_data="home")],
+            ]),
+        )
+        return
 
     if action == "broadcast" and step == "message":
         data["from_chat_id"] = message.chat.id
@@ -1129,135 +1199,551 @@ async def unblock_user_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+def find_song_by_code(code: str):
+    code = (code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z][0-9]+", code):
+        return None
+    with closing(get_db()) as conn:
+        return conn.execute(
+            "SELECT * FROM songs WHERE code = ? OR (code IS NULL AND 'A' || printf('%04d', id) = ?)",
+            (code, code),
+        ).fetchone()
+
+
+def get_setting(key: str) -> str | None:
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(key: str, value: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+def get_backup_channel() -> tuple[int, str] | None:
+    raw = get_setting("backup_channel")
+    if not raw or "|" not in raw:
+        return None
+    chat_id, title = raw.split("|", 1)
+    try:
+        return int(chat_id), title
+    except ValueError:
+        return None
+
+
+def db_time_to_tehran(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return value
+    return tehran_time(dt)
+
+
+def back_keyboard(target: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        button("🔙 بازگشت", callback_data=target),
+        button("❌ لغو", callback_data="cancel", style="danger"),
+    ]])
+
+
+# ---------------------------------------------------------------- backup ---
+
 backup_lock = asyncio.Lock()
-BACKUP_PART_LIMIT = 45 * 1024 * 1024
-BACKUP_DEFAULT_EXT = {"audio": ".mp3", "voice": ".ogg", "video": ".mp4", "document": ""}
+backup_stop = asyncio.Event()
 
 
-def _backup_safe_name(text: str) -> str:
-    return re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", text or "").strip()[:60]
+def backup_rows(scope: str, song_id: int | None):
+    query = """
+        SELECT v.song_id, v.version_no, v.file_id, v.file_type, s.title, s.artist, s.code
+        FROM versions v JOIN songs s ON s.id = v.song_id
+    """
+    params: tuple = ()
+    if scope == "from":
+        query += " WHERE s.id >= ?"
+        params = (song_id,)
+    elif scope == "one":
+        query += " WHERE s.id = ?"
+        params = (song_id,)
+    query += " ORDER BY s.id, v.version_no"
+    with closing(get_db()) as conn:
+        return conn.execute(query, params).fetchall()
 
 
-def _backup_write_zip(zip_path: str, files: list[tuple[str, str]]):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-        for path, arcname in files:
-            zf.write(path, arcname)
+def backup_scope_text(data: dict) -> str:
+    scope = data.get("scope")
+    if scope == "from":
+        return f"از آهنگ {data.get('code')} به بعد"
+    if scope == "one":
+        return f"فقط آهنگ {data.get('code')}"
+    return "همه‌ی آهنگ‌ها"
+
+
+def backup_dest_keyboard() -> InlineKeyboardMarkup:
+    rows = [[button("👤 پیوی خودم", callback_data="bk_dest:me", style="primary")]]
+    saved = get_backup_channel()
+    if saved:
+        rows.append([button(f"📢 {saved[1][:30]}", callback_data="bk_dest:saved", style="success")])
+        rows.append([button("➕ کانال یا گروه دیگر", callback_data="bk_dest:new")])
+    else:
+        rows.append([button("📢 کانال بکاپ", callback_data="bk_dest:new", style="success")])
+    rows.append([button("📨 یک کاربر (با آیدی)", callback_data="bk_dest:user")])
+    rows.append([button("🔙 بازگشت", callback_data="backup_songs"), button("❌ لغو", callback_data="cancel", style="danger")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_backup_dest(message: Message):
+    await message.answer("کجا بفرستم؟", reply_markup=backup_dest_keyboard())
+
+
+async def show_backup_confirm(message: Message):
+    data = admin_state[ADMIN_ID]["data"]
+    total = len(backup_rows(data["scope"], data.get("song_id")))
+    await message.answer(
+        f"📋 <b>تأیید بکاپ</b>\n\n"
+        f"🎵 محتوا: {html.escape(backup_scope_text(data))}\n"
+        f"📦 تعداد فایل: {total}\n"
+        f"📍 مقصد: {html.escape(data['dest_label'])}\n\n"
+        "شروع کنم؟",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("✅ شروع ارسال", callback_data="bk_go", style="success")],
+            [button("🔙 بازگشت", callback_data="bk_back_dest"), button("❌ لغو", callback_data="cancel", style="danger")],
+        ]),
+    )
+
+
+async def resolve_backup_channel(message: Message) -> tuple[int, str] | None:
+    origin = getattr(message, "forward_origin", None)
+    chat_id = None
+    if origin is not None and getattr(origin, "type", None) == "channel":
+        chat_id = origin.chat.id
+    else:
+        text = (message.text or "").strip()
+        if re.fullmatch(r"-?[0-9]+", text):
+            chat_id = int(text)
+    if chat_id is None:
+        await message.answer(
+            "یک پیام از کانال را اینجا فوروارد کن، یا آیدی عددی کانال را بفرست.",
+            reply_markup=back_keyboard("bk_back_dest"),
+        )
+        return None
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.me()
+        member = await bot.get_chat_member(chat_id, me.id)
+    except Exception:
+        await message.answer(
+            "ربات به این چت دسترسی ندارد. ربات را در آن اضافه کن و دوباره امتحان کن.",
+            reply_markup=back_keyboard("bk_back_dest"),
+        )
+        return None
+    if chat.type == "channel":
+        allowed = member.status in ("administrator", "creator") and getattr(member, "can_post_messages", True) is not False
+    else:
+        allowed = member.status not in ("left", "kicked")
+    if not allowed:
+        await message.answer(
+            "ربات باید در این کانال ادمین باشد و اجازه‌ی ارسال پیام داشته باشد.",
+            reply_markup=back_keyboard("bk_back_dest"),
+        )
+        return None
+    return chat_id, (chat.title or str(chat_id))
+
+
+async def send_backup_media(chat_id: int, row, caption: str):
+    kwargs = dict(chat_id=chat_id, caption=caption, parse_mode="HTML")
+    file_id, file_type = row["file_id"], row["file_type"]
+    if file_type == "audio":
+        return await bot.send_audio(audio=file_id, **kwargs)
+    if file_type == "voice":
+        return await bot.send_voice(voice=file_id, **kwargs)
+    if file_type == "video":
+        return await bot.send_video(video=file_id, **kwargs)
+    return await bot.send_document(document=file_id, **kwargs)
+
+
+def backup_caption(row, multi_version: bool) -> str:
+    title = (row["title"] or "").strip()
+    artist = (row["artist"] or "").strip()
+    lines = []
+    if title:
+        lines.append(f"🎵 <b>{html.escape(title)}</b>")
+    if artist:
+        lines.append(f"👤 {html.escape(artist)}")
+    lines.append(f"code: {song_code(row['song_id'], row['code'])}")
+    if multi_version:
+        lines.append(f"نسخه {row['version_no']}")
+    return "\n".join(lines)
 
 
 @dp.callback_query(F.data == "backup_songs")
-async def backup_songs_callback(callback: CallbackQuery):
+async def backup_menu_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    if backup_lock.locked():
-        await callback.answer("بکاپ در حال انجام است.", show_alert=True)
+    admin_state[ADMIN_ID] = {"action": "backup", "step": "scope", "data": {}}
+    await callback.message.answer(
+        "💾 <b>بکاپ آهنگ‌ها</b>\n\nچه چیزی بکاپ شود؟",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("📦 همه‌ی آهنگ‌ها", callback_data="bk_scope:all", style="primary")],
+            [button("⏩ از یک کد به بعد", callback_data="bk_scope:from", style="primary")],
+            [button("🎯 فقط یک آهنگ", callback_data="bk_scope:one", style="primary")],
+            [button("🔙 بازگشت", callback_data="home")],
+        ]),
+    )
+    await callback.answer()
+
+
+def get_backup_state():
+    state = admin_state.get(ADMIN_ID)
+    if not state or state.get("action") != "backup":
+        return None
+    return state
+
+
+@dp.callback_query(F.data.startswith("bk_scope:"))
+async def backup_scope_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
         return
+    state = get_backup_state()
+    if not state:
+        await callback.answer("منقضی شده. دوباره از بکاپ شروع کن.", show_alert=True)
+        return
+    scope = callback.data.split(":", 1)[1]
+    state["data"] = {"scope": scope}
+    if scope == "all":
+        state["step"] = "dest"
+        await show_backup_dest(callback.message)
+    else:
+        state["step"] = "code"
+        hint = (
+            "کدی که بکاپ از آن آهنگ به بعد شروع شود را بفرست (مثلاً A0003). خود آن آهنگ هم داخل بکاپ است:"
+            if scope == "from"
+            else "کد آهنگ را بفرست (مثلاً B25):"
+        )
+        await callback.message.answer(hint, reply_markup=back_keyboard("backup_songs"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("bk_dest:"))
+async def backup_dest_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = get_backup_state()
+    if not state or "scope" not in state["data"]:
+        await callback.answer("منقضی شده. دوباره از بکاپ شروع کن.", show_alert=True)
+        return
+    data = state["data"]
+    dest = callback.data.split(":", 1)[1]
+    if dest == "me":
+        data.update(dest_chat_id=ADMIN_ID, dest_label="پیوی خودت", dest_kind="me")
+        state["step"] = "confirm"
+        await show_backup_confirm(callback.message)
+    elif dest == "saved":
+        saved = get_backup_channel()
+        if not saved:
+            await callback.answer("کانالی ذخیره نشده.", show_alert=True)
+            return
+        data.update(dest_chat_id=saved[0], dest_label=f"کانال {saved[1]}", dest_kind="channel")
+        state["step"] = "confirm"
+        await show_backup_confirm(callback.message)
+    elif dest == "new":
+        state["step"] = "channel"
+        await callback.message.answer(
+            "یک پیام از کانال بکاپ را اینجا فوروارد کن (یا آیدی عددی‌اش را بفرست). ربات باید در آن ادمین باشد:",
+            reply_markup=back_keyboard("bk_back_dest"),
+        )
+    elif dest == "user":
+        state["step"] = "user"
+        await callback.message.answer(
+            "آیدی عددی کاربر را بفرست. فقط وقتی ارسال می‌شود که آن کاربر قبلاً ربات را استارت کرده باشد:",
+            reply_markup=back_keyboard("bk_back_dest"),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bk_back_dest")
+async def backup_back_dest_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = get_backup_state()
+    if not state or "scope" not in state["data"]:
+        await callback.answer("منقضی شده. دوباره از بکاپ شروع کن.", show_alert=True)
+        return
+    state["step"] = "dest"
+    await show_backup_dest(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bk_stop")
+async def backup_stop_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    backup_stop.set()
+    await callback.answer("بعد از فایل فعلی متوقف می‌شود.")
+
+
+@dp.callback_query(F.data == "bk_go")
+async def backup_go_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    state = get_backup_state()
+    if not state or state.get("step") != "confirm":
+        await callback.answer("منقضی شده. دوباره از بکاپ شروع کن.", show_alert=True)
+        return
+    if backup_lock.locked():
+        await callback.answer("یک بکاپ در حال انجام است.", show_alert=True)
+        return
+    data = dict(state["data"])
+    clear_state()
     await callback.answer()
 
     async with backup_lock:
-        with closing(get_db()) as conn:
-            rows = conn.execute("""
-                SELECT v.song_id, v.version_no, v.file_id, v.file_type, s.title, s.artist, s.code
-                FROM versions v JOIN songs s ON s.id = v.song_id
-                ORDER BY v.song_id, v.version_no
-            """).fetchall()
+        backup_stop.clear()
+        rows = backup_rows(data["scope"], data.get("song_id"))
         if not rows:
-            await callback.message.answer("هنوز آهنگی ثبت نشده است.", reply_markup=admin_menu())
+            await callback.message.answer("آهنگی برای بکاپ پیدا نشد.", reply_markup=admin_menu())
             return
-        await callback.message.answer(f"⏳ بکاپ {len(rows)} فایل شروع شد. بعد از آماده شدن، فایل‌های zip پشت‌سرهم ارسال می‌شوند.")
 
+        dest = data["dest_chat_id"]
         counts: dict[int, int] = {}
         for r in rows:
             counts[r["song_id"]] = counts.get(r["song_id"], 0) + 1
 
-        date_tag = tehran_time()[:10]
-        used_names: set[str] = set()
-        batch: list[tuple[str, str]] = []
-        batch_size = 0
-        part_no = 0
-        saved = 0
+        stop_keyboard = InlineKeyboardMarkup(inline_keyboard=[[button("⛔ توقف", callback_data="bk_stop", style="danger")]])
+        status = await callback.message.answer(f"⏳ ارسال شروع شد: 0 از {len(rows)}", reply_markup=stop_keyboard)
+
+        delay = 3.2 if dest < 0 else 1.1
+        sent = 0
         failed: list[str] = []
-        send_failed: list[int] = []
+        consecutive_failures = 0
+        stopped = False
+        aborted = False
 
-        with tempfile.TemporaryDirectory() as tmp:
-
-            async def flush():
-                nonlocal batch, batch_size, part_no
-                if not batch:
-                    return
-                part_no += 1
-                current_part = part_no
-                files = batch
-                batch, batch_size = [], 0
-                zip_path = os.path.join(tmp, f"backup_{date_tag}_part{current_part}.zip")
-                await asyncio.to_thread(_backup_write_zip, zip_path, files)
-                for path, _ in files:
-                    os.remove(path)
-                sent = False
-                for _attempt in range(2):
-                    try:
-                        await bot.send_document(
-                            ADMIN_ID,
-                            FSInputFile(zip_path),
-                            caption=f"💾 بکاپ آهنگ‌ها - قسمت {current_part} ({len(files)} فایل)",
-                            request_timeout=900,
-                        )
-                        sent = True
-                        break
-                    except TelegramRetryAfter as e:
-                        await asyncio.sleep(e.retry_after)
-                    except Exception:
-                        logging.exception("Could not send backup part %s", current_part)
-                        break
-                if not sent:
-                    send_failed.append(current_part)
-                os.remove(zip_path)
-
-            for i, r in enumerate(rows):
-                code = song_code(r["song_id"], r["code"])
-                label = f"{code} (نسخه {r['version_no']})"
+        for i, r in enumerate(rows, 1):
+            if backup_stop.is_set():
+                stopped = True
+                break
+            label = f"{song_code(r['song_id'], r['code'])} (نسخه {r['version_no']})"
+            caption = backup_caption(r, counts[r["song_id"]] > 1)
+            ok = False
+            for _attempt in range(2):
                 try:
-                    tg_file = await bot.get_file(r["file_id"])
-                    ext = os.path.splitext(tg_file.file_path or "")[1] or BACKUP_DEFAULT_EXT.get(r["file_type"], "")
-                    name = " - ".join(p for p in (code, _backup_safe_name(r["title"]), _backup_safe_name(r["artist"])) if p)
-                    if counts[r["song_id"]] > 1:
-                        name += f" (v{r['version_no']})"
-                    arcname = name + ext
-                    n = 2
-                    while arcname.lower() in used_names:
-                        arcname = f"{name} ({n}){ext}"
-                        n += 1
-                    local = os.path.join(tmp, f"{i}{ext}")
-                    await bot.download_file(tg_file.file_path, destination=local, timeout=300)
-                    size = os.path.getsize(local)
+                    await send_backup_media(dest, r, caption)
+                    ok = True
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
                 except Exception:
-                    logging.exception("Backup download failed for %s", label)
-                    failed.append(label)
-                    continue
-                used_names.add(arcname.lower())
-                if batch and batch_size + size > BACKUP_PART_LIMIT:
-                    await flush()
-                batch.append((local, arcname))
-                batch_size += size
-                saved += 1
-            await flush()
+                    logging.exception("Backup send failed for %s", label)
+                    break
+            if ok:
+                sent += 1
+                consecutive_failures = 0
+            else:
+                failed.append(label)
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    aborted = True
+                    break
+            if i % 5 == 0:
+                try:
+                    await status.edit_text(f"⏳ ارسال شده: {sent} از {len(rows)}", reply_markup=stop_keyboard)
+                except Exception:
+                    pass
+            await asyncio.sleep(delay)
+
+        if data["scope"] == "all" and not stopped and not aborted and sent and data.get("dest_kind") != "user":
+            try:
+                await bot.send_document(
+                    dest,
+                    FSInputFile(DB_NAME, filename="music_bot.db"),
+                    caption="🗄 فایل دیتابیس (اطلاعات آهنگ‌ها و کدها)",
+                )
+            except Exception:
+                logging.exception("Could not send database backup")
+
+        try:
+            await status.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
         report = (
             f"💾 <b>گزارش بکاپ</b>\n\n"
-            f"✅ ذخیره‌شده: {saved}\n"
-            f"❌ ناموفق: {len(failed)}\n"
-            f"📦 تعداد فایل zip: {part_no}"
+            f"📍 مقصد: {html.escape(data['dest_label'])}\n"
+            f"✅ ارسال‌شده: {sent} از {len(rows)}\n"
+            f"❌ ناموفق: {len(failed)}"
         )
+        if stopped:
+            report += "\n⛔ ارسال متوقف شد."
+        if aborted:
+            report += "\n⚠️ چند ارسال پشت‌سرهم ناموفق بود و ارسال متوقف شد. دسترسی ربات به مقصد را بررسی کن."
         if failed:
-            report += "\n\nناموفق‌ها (معمولاً فایل‌های بالای ۲۰ مگابایت):\n" + "\n".join(failed[:30])
+            report += "\n\nناموفق‌ها:\n" + "\n".join(failed[:30])
             if len(failed) > 30:
                 report += f"\nو {len(failed) - 30} مورد دیگر"
-        if send_failed:
-            report += "\n\n⚠️ ارسال این قسمت‌ها ناموفق بود: " + ", ".join(str(n) for n in send_failed)
         await callback.message.answer(report, parse_mode="HTML", reply_markup=admin_menu())
+
+
+# ------------------------------------------------------------ song stats ---
+
+SONG_STATS_PAGE_SIZE = 10
+SONG_STATS_PERIODS = {"all": "همه‌ی زمان‌ها", "30": "۳۰ روز اخیر", "7": "۷ روز اخیر"}
+
+
+def render_song_stats(period: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    if period not in SONG_STATS_PERIODS:
+        period = "all"
+    since = None if period == "all" else f"-{int(period)} days"
+    with closing(get_db()) as conn:
+        total_songs = conn.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        pages = max(1, -(-total_songs // SONG_STATS_PAGE_SIZE))
+        page = min(max(page, 0), pages - 1)
+        if since:
+            join = "LEFT JOIN download_stats d ON d.song_id = s.id AND d.created_at >= datetime('now', ?)"
+            params: tuple = (since, SONG_STATS_PAGE_SIZE, page * SONG_STATS_PAGE_SIZE)
+            total_downloads = conn.execute("SELECT COUNT(*) FROM download_stats WHERE created_at >= datetime('now', ?)", (since,)).fetchone()[0]
+        else:
+            join = "LEFT JOIN download_stats d ON d.song_id = s.id"
+            params = (SONG_STATS_PAGE_SIZE, page * SONG_STATS_PAGE_SIZE)
+            total_downloads = conn.execute("SELECT COUNT(*) FROM download_stats").fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT s.id, s.code, s.title, s.artist, COUNT(d.id) AS c
+            FROM songs s {join}
+            GROUP BY s.id ORDER BY c DESC, s.id DESC LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+
+    lines = [f"🎧 <b>آمار دانلود آهنگ‌ها</b> — {SONG_STATS_PERIODS[period]}", f"⬇️ مجموع دانلود: {total_downloads}", f"📄 صفحه {page + 1} از {pages}", ""]
+    if not rows:
+        lines.append("هنوز آهنگی ثبت نشده است.")
+    for n, r in enumerate(rows, page * SONG_STATS_PAGE_SIZE + 1):
+        title = (r["title"] or "").strip() or "بدون نام"
+        lines.append(f"{n}. <b>{song_code(r['id'], r['code'])}</b> | {html.escape(title)} | ⬇️ {r['c']}")
+
+    keyboard = [[
+        button(("✅ " if key == period else "") + label, callback_data=f"ss:{key}:0")
+        for key, label in SONG_STATS_PERIODS.items()
+    ]]
+    nav = []
+    if page > 0:
+        nav.append(button("◀️ قبلی", callback_data=f"ss:{period}:{page - 1}"))
+    nav.append(button(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(button("بعدی ▶️", callback_data=f"ss:{period}:{page + 1}"))
+    keyboard.append(nav)
+    keyboard.append([button("🔎 آمار یک آهنگ", callback_data="ss_one", style="primary")])
+    keyboard.append([button("🔙 بازگشت", callback_data="home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def render_one_song_stats(song) -> str:
+    song_id = song["id"]
+    title = (song["title"] or "").strip() or "بدون نام"
+    artist = (song["artist"] or "").strip() or "بدون خواننده"
+    with closing(get_db()) as conn:
+        versions = conn.execute("SELECT version_no FROM versions WHERE song_id = ? ORDER BY version_no", (song_id,)).fetchall()
+        per_version = {
+            r["version_no"]: r
+            for r in conn.execute(
+                "SELECT version_no, COUNT(*) AS c, MAX(created_at) AS last FROM download_stats WHERE song_id = ? GROUP BY version_no",
+                (song_id,),
+            ).fetchall()
+        }
+        total = conn.execute("SELECT COUNT(*) FROM download_stats WHERE song_id = ?", (song_id,)).fetchone()[0]
+        week = conn.execute(
+            "SELECT COUNT(*) FROM download_stats WHERE song_id = ? AND created_at >= datetime('now', '-7 days')", (song_id,)
+        ).fetchone()[0]
+        month = conn.execute(
+            "SELECT COUNT(*) FROM download_stats WHERE song_id = ? AND created_at >= datetime('now', '-30 days')", (song_id,)
+        ).fetchone()[0]
+        last = conn.execute("SELECT MAX(created_at) FROM download_stats WHERE song_id = ?", (song_id,)).fetchone()[0]
+
+    lines = [
+        f"🎧 <b>{html.escape(title)}</b>",
+        f"👤 {html.escape(artist)}",
+        f"🆔 کد: {song_code(song_id, song['code'])}",
+        "",
+        f"⬇️ مجموع دانلود: {total}",
+        f"📅 ۳۰ روز اخیر: {month}",
+        f"📅 ۷ روز اخیر: {week}",
+        f"🕒 آخرین دانلود: {db_time_to_tehran(last)}",
+    ]
+    if versions:
+        lines.append("")
+        lines.append("🎚 به تفکیک نسخه:")
+        for v in versions:
+            stat = per_version.get(v["version_no"])
+            lines.append(f"• نسخه {v['version_no']}: {stat['c'] if stat else 0}")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "ss_open")
+async def song_stats_open_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    clear_state()
+    text, keyboard = render_song_stats("all", 0)
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ss:"))
+async def song_stats_page_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    try:
+        _, period, page = callback.data.split(":")
+        text, keyboard = render_song_stats(period, int(page))
+    except ValueError:
+        await callback.answer()
+        return
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ss_one")
+async def song_stats_one_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    admin_state[ADMIN_ID] = {"action": "song_stats", "step": "code", "data": {}}
+    await callback.message.answer("کد آهنگ را بفرست (مثلاً B25):", reply_markup=back_keyboard("ss_open"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
+
+
+# -------------------------------------------------------------- commands ---
+
+async def setup_commands():
+    try:
+        await bot.set_my_commands([BotCommand(command="start", description="شروع")], scope=BotCommandScopeDefault())
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="شروع"), BotCommand(command="panel", description="پنل مدیریت")],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
+    except Exception:
+        logging.exception("Could not set bot commands")
 
 
 async def main():
     init_db()
+    await setup_commands()
     logging.info("Music bot started")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
