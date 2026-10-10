@@ -49,6 +49,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 admin_state = {}
+# Users waiting to join the channel before a download (bounded so it can never grow forever).
+pending_downloads: dict[int, dict] = {}
+PENDING_DOWNLOADS_MAX = 2000
 
 
 def get_db():
@@ -427,11 +430,10 @@ async def deliver_pending_song(user_id: int, chat_id: int, song_id: int, version
         await bot.send_message(chat_id, "این نسخه دیگر وجود ندارد.")
         return True
     if not await is_channel_member(user_id):
-        admin_state[user_id] = {
-            "action": "pending_download",
-            "song_id": song_id,
-            "version_no": version_no,
-        }
+        pending_downloads.pop(user_id, None)
+        pending_downloads[user_id] = {"song_id": song_id, "version_no": version_no}
+        while len(pending_downloads) > PENDING_DOWNLOADS_MAX:
+            pending_downloads.pop(next(iter(pending_downloads)))
         await bot.send_message(
             chat_id,
             "برای دریافت فایل کامل، ابتدا عضو کانال شوید و بعد «بررسی عضویت» را بزنید.",
@@ -491,11 +493,10 @@ async def check_membership_callback(callback: CallbackQuery):
 
     await callback.answer("عضویت تأیید شد.")
     # A pending deep-link is stored per user when needed.
-    pending = admin_state.get(callback.from_user.id)
-    if pending and pending.get("action") == "pending_download":
+    pending = pending_downloads.pop(callback.from_user.id, None)
+    if pending:
         song_id = pending["song_id"]
         version_no = pending["version_no"]
-        admin_state.pop(callback.from_user.id, None)
         await deliver_pending_song(callback.from_user.id, callback.from_user.id, song_id, version_no)
     else:
         await callback.message.answer("عضویت شما تأیید شد. حالا از لینک آهنگ وارد شوید.")
@@ -1741,9 +1742,75 @@ async def setup_commands():
         logging.exception("Could not set bot commands")
 
 
+def current_memory_mb() -> float | None:
+    # Current resident memory of this process (Linux), in MB.
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return None
+
+
+MEMORY_LOG_CHAT_ID = int(os.getenv("MEMORY_LOG_CHAT_ID", "0"))
+MEMORY_ALERT_MB = float(os.getenv("MEMORY_ALERT_MB", "230"))
+_background_tasks: set = set()
+
+
+async def memory_logger(interval: int = 600):
+    """Log memory to the console, keep ONE live status message in Telegram, and alert on growth."""
+    chat_id = MEMORY_LOG_CHAT_ID or LOG_GROUP_ID or ADMIN_ID
+    first = None
+    status_message = None
+    last_alert_mb = 0.0
+    while True:
+        mb = current_memory_mb()
+        if mb is not None:
+            if first is None:
+                first = mb
+            growth = mb - first
+            tasks = len(asyncio.all_tasks())
+            logging.info("Memory | now=%.1f MB | since_start=%+.1f MB | tasks=%d", mb, growth, tasks)
+            text = (
+                f"🧠 <b>مصرف رم ربات</b>\n\n"
+                f"الان: {mb:.0f} MB\n"
+                f"تغییر از شروع: {growth:+.0f} MB\n"
+                f"تسک‌های فعال: {tasks}\n"
+                f"🕒 {tehran_time()}"
+            )
+            try:
+                if status_message is None:
+                    status_message = await bot.send_message(chat_id, text, parse_mode="HTML", disable_notification=True)
+                else:
+                    await bot.edit_message_text(text, chat_id=chat_id, message_id=status_message.message_id, parse_mode="HTML")
+            except Exception:
+                status_message = None
+                logging.exception("Could not send memory status")
+            if (mb >= MEMORY_ALERT_MB or growth >= 60) and mb >= last_alert_mb + 20:
+                last_alert_mb = mb
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"⚠️ <b>هشدار رم</b>\n\nمصرف رم {mb:.0f} MB است ({growth:+.0f} MB از شروع).",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    logging.exception("Could not send memory alert")
+        await asyncio.sleep(interval)
+
+
 async def main():
     init_db()
     await setup_commands()
+    task = asyncio.create_task(memory_logger())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     logging.info("Music bot started")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
